@@ -6,11 +6,11 @@ import os
 
 app = Flask(__name__)
 
+# 從環境變數讀取（Railway Variables）
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    # 方便在 Railway Logs 看出未設定環境變數
     print("[WARN] Missing LINE_CHANNEL_SECRET or LINE_CHANNEL_ACCESS_TOKEN env vars.")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN) if CHANNEL_ACCESS_TOKEN else None
@@ -20,8 +20,14 @@ parser = WebhookParser(CHANNEL_SECRET) if CHANNEL_SECRET else None
 def health():
     return "OK", 200
 
-@app.route("/callback", methods=["POST"])
+# 同一路徑接受 GET（給 Verify）與 POST（正式事件）
+@app.route("/callback", methods=["GET", "POST"])
 def callback():
+    # A) LINE Console 的 Verify 會發 GET，要回 200
+    if request.method == "GET":
+        return "OK", 200
+
+    # B) LINE 事件是 POST，以下是處理訊息事件
     if parser is None or line_bot_api is None:
         abort(500)
 
