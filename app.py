@@ -1,4 +1,4 @@
-# app.py  —  LINE Bot + Google Sheets 寫入（寄書任務）
+# app.py — LINE Bot + Google Sheets 寫入（寄書任務）
 import os, json, datetime, re
 from flask import Flask, request, abort, jsonify
 
@@ -46,26 +46,53 @@ def infer_status(ship_date: str) -> str:
     return "已寄送完成" if ship_date and str(ship_date).strip() else "未寄出"
 
 def normalize_phone(p: str) -> str:
-    """保留數字（先簡化處理：移除空白/破折號/其他符號）"""
+    """保留數字（移除空白/破折號/其他符號）"""
     return "".join(ch for ch in (p or "") if ch.isdigit())
 
 def safe_text(x):
     return x if x is not None else ""
 
 def get_display_name_from_event(event) -> str:
-    """盡力取得使用者顯示名稱（群組/一對一皆可）"""
+    """盡力取得使用者顯示名稱"""
     try:
         if event.source.type == "group":
             return line_bot_api.get_group_member_profile(event.source.group_id, event.source.user_id).display_name
         elif event.source.type == "room":
             return line_bot_api.get_room_member_profile(event.source.room_id, event.source.user_id).display_name
         else:
-            # 1:1
             return line_bot_api.get_profile(event.source.user_id).display_name
     except Exception:
         return "未知使用者"
 
-# ====== 將一筆訂單寫入 Google Sheets（依你的欄位 14 欄） ======
+# ====== 郵遞區號參照表 ======
+def load_zip_dict():
+    try:
+        zip_ws = sh.worksheet("郵遞區號參照表")
+        data = zip_ws.get_all_records()  # [{'地區': '中正區', '郵遞區號': 100}, ...]
+        zip_dict = {}
+        for row in data:
+            code = str(row.get("郵遞區號", "")).strip()
+            name = str(row.get("地區", "")).strip()
+            if code and name:
+                zip_dict[code] = name
+        print(f"[INFO] 已載入 {len(zip_dict)} 筆郵遞區號")
+        return zip_dict
+    except Exception as e:
+        print("[WARN] 無法載入郵遞區號參照表:", e)
+        return {}
+
+ZIP_DICT = load_zip_dict()
+
+def check_zip(address: str) -> str:
+    """回傳檢核狀態"""
+    if not address:
+        return "缺少地址"
+    zip3 = address[:3]
+    if zip3 in ZIP_DICT:
+        return "正常"
+    return "缺少/錯誤郵遞區號"
+
+# ====== 將一筆訂單寫入 Google Sheets ======
 def append_order_row(
     建單人, 學員姓名, 學員電話, 寄送地址,
     書籍名稱, 語別="", 寄送方式="", 寄出日期="",
@@ -75,44 +102,46 @@ def append_order_row(
     row = [
         record_id,                 # 1 紀錄ID
         now_tpe_str(),             # 2 建單日期
-        safe_text(建單人),         # 3 建單人（LINE 名稱）
+        safe_text(建單人),         # 3 建單人
         safe_text(學員姓名),       # 4 學員姓名
         normalize_phone(學員電話), # 5 學員電話
-        safe_text(寄送地址),       # 6 寄送地址（郵遞區號前三碼之後再自動化）
-        safe_text(書籍名稱),       # 7 書籍名稱（V1 先填原文；日後再換主檔正式名）
+        safe_text(寄送地址),       # 6 寄送地址
+        safe_text(書籍名稱),       # 7 書籍名稱
         safe_text(語別),           # 8 語別
         safe_text(寄送方式),       # 9 寄送方式
         safe_text(寄出日期),       # 10 寄出日期
         safe_text(託運單號),       # 11 託運單號
-        infer_status(寄出日期),     # 12 寄送狀態（有寄出日期=已寄送完成）
+        infer_status(寄出日期),     # 12 寄送狀態
         safe_text(備註),           # 13 備註
-        safe_text(資料檢核狀態)    # 14 資料檢核狀態
+        check_zip(寄送地址)        # 14 資料檢核狀態
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
+    print(f"[Sheets] Append row success: {row}")
     return record_id
 
-# ====== 解析「#寄書需求」訊息 ======
-# 支援格式（例）：
-# #寄書需求
-# 學員姓名：王小明
-# 學員電話：0912-345-678
-# 寄送地址：406 台中市北屯區文心路四段100號10樓
-# 書籍名稱：
-# - Let's Go 5（第五版）
-# - Let's Go 6（第五版）
-# 備註：請週五前寄出；雅思B.3
-FIELD_KEYS = ["學員姓名", "學員電話", "寄送地址", "書籍名稱", "備註"]
+# ====== 欄位同義詞對照 ======
+FIELD_ALIASES = {
+    "學員姓名": ["學員姓名", "姓名", "名字"],
+    "學員電話": ["學員電話", "電話", "手機"],
+    "寄送地址": ["寄送地址", "地址", "住址"],
+    "書籍名稱": ["書籍名稱", "書", "教材", "課本"],
+    "備註": ["備註", "備考", "說明"]
+}
 
+def normalize_field_key(key: str) -> str:
+    for std, aliases in FIELD_ALIASES.items():
+        if key in aliases:
+            return std
+    return key
+
+# ====== 解析「#寄書需求」訊息 ======
 def parse_order_text(text: str):
-    """回傳 dict：{學員姓名, 學員電話, 寄送地址, 書籍清單(list[str]), 備註}；若缺欄位會標示"""
     result = {"學員姓名": "", "學員電話": "", "寄送地址": "", "備註": "", "書籍清單": []}
     if not text:
         return result
 
-    # 統一換行
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
 
-    # 找到 '#寄書需求' 之後的內容
     if not any("#寄書需求" in ln for ln in lines):
         return result
     start_idx = 0
@@ -122,21 +151,18 @@ def parse_order_text(text: str):
             break
     lines = lines[start_idx:]
 
-    # 先掃 key:value 形式
     buffer_books = []
     current_field = None
     for ln in lines:
-        # 書名多行項目：允許以 '-' 或 '・' 或 '•' 開頭
         if re.match(r"^[-•・]\s*", ln):
             val = re.sub(r"^[-•・]\s*", "", ln)
             if val:
                 buffer_books.append(val)
             continue
 
-        # 一般 "欄位：值"
         m = re.match(r"^([^：:]+)\s*[：:]\s*(.*)$", ln)
         if m:
-            key = m.group(1).strip()
+            key = normalize_field_key(m.group(1).strip())
             val = m.group(2).strip()
             current_field = None
 
@@ -147,23 +173,19 @@ def parse_order_text(text: str):
             elif key == "寄送地址":
                 result["寄送地址"] = val
             elif key == "書籍名稱":
-                # 可能下一行才是項目；這一行若也有值就先加
                 if val:
                     buffer_books.append(val)
                 current_field = "書籍名稱"
             elif key == "備註":
                 result["備註"] = val if result["備註"] == "" else (result["備註"] + "；" + val)
             else:
-                # 其他未知欄位全部塞備註
                 extra = f"{key}：{val}"
                 result["備註"] = extra if result["備註"] == "" else (result["備註"] + "；" + extra)
             continue
 
-        # 若上一行是「書籍名稱：」且本行不是 - 開頭，就把整行當一本書
         if current_field == "書籍名稱" and ln:
             buffer_books.append(ln)
 
-    # 若完全沒抓到書，buffer_books 可能仍空；允許之後回報缺漏
     result["書籍清單"] = [bk for bk in [b.strip() for b in buffer_books] if bk]
     return result
 
@@ -180,28 +202,25 @@ def check_required_fields(parsed: dict):
 def health():
     return "OK", 200
 
-# ====== 測試寫入（手動驗證用） ======
+# ====== 測試寫入 ======
 @app.get("/sheets/test")
 def sheets_test():
     rid = append_order_row(
         建單人="測試用",
         學員姓名="王小明",
         學員電話="0912345678",
-        寄送地址="台中市北屯區文心路四段100號10樓",
+        寄送地址="406 台中市北屯區文心路四段100號10樓",
         書籍名稱="Let's Go 5（第五版）",
         備註="這是一筆測試"
     )
     return jsonify({"ok": True, "record_id": rid})
 
 # ====== LINE Webhook ======
-# 接受 GET/HEAD（Verify 用）與 POST（正式事件）
 @app.route("/callback", methods=["GET", "HEAD", "POST"])
 def callback():
-    # 1) Verify 會用 GET/HEAD 來探測
     if request.method in ("GET", "HEAD"):
         return "OK", 200
 
-    # 2) 有些 Verify/健康檢查會發沒有簽章的 POST，直接回 200
     signature = request.headers.get("X-Line-Signature")
     if not signature:
         return "OK", 200
@@ -221,7 +240,6 @@ def callback():
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
             text = event.message.text.strip()
 
-            # ---- 寄書需求觸發 ----
             if "#寄書需求" in text:
                 parsed = parse_order_text(text)
                 missing = check_required_fields(parsed)
@@ -238,7 +256,6 @@ def callback():
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                     continue
 
-                # 寫入：一書一列
                 creator = get_display_name_from_event(event)
                 rids = []
                 for book in parsed["書籍清單"]:
@@ -252,7 +269,6 @@ def callback():
                     )
                     rids.append(rid)
 
-                summary = "、".join(parsed['學員姓名'] for _ in [0])  # 單一姓名
                 books_preview = "\n- " + "\n- ".join(parsed["書籍清單"])
                 reply = (
                     f"✅ 已建立寄書需求（{len(rids)} 筆）：\n"
@@ -263,7 +279,6 @@ def callback():
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                 continue
 
-            # ---- 其他文字：原樣回覆 ----
             reply = f"你說：{text}"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
