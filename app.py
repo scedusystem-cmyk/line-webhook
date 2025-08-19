@@ -1,4 +1,4 @@
-# app.py — LINE Bot + Google Sheets 寫入（寄書任務）
+# app.py — LINE Bot + Google Sheets 寫入（寄書任務 + 自動補郵遞區號）
 import os, json, datetime, re
 from flask import Flask, request, abort, jsonify
 
@@ -34,11 +34,9 @@ ws = sh.worksheet(SHEET_NAME)
 
 # ====== 小工具 ======
 def now_tpe_str():
-    """回傳台北時區 yyyy-mm-dd HH:MM:SS"""
     return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 def make_record_id():
-    """SJREQ-YYYYMMDD-hhmmss"""
     ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=8))
     return "SJREQ-" + ts.strftime("%Y%m%d-%H%M%S")
 
@@ -46,14 +44,12 @@ def infer_status(ship_date: str) -> str:
     return "已寄送完成" if ship_date and str(ship_date).strip() else "未寄出"
 
 def normalize_phone(p: str) -> str:
-    """保留數字（移除空白/破折號/其他符號）"""
     return "".join(ch for ch in (p or "") if ch.isdigit())
 
 def safe_text(x):
     return x if x is not None else ""
 
 def get_display_name_from_event(event) -> str:
-    """盡力取得使用者顯示名稱"""
     try:
         if event.source.type == "group":
             return line_bot_api.get_group_member_profile(event.source.group_id, event.source.user_id).display_name
@@ -83,14 +79,14 @@ def load_zip_dict():
 
 ZIP_DICT = load_zip_dict()
 
-def check_zip(address: str) -> str:
-    """回傳檢核狀態"""
+def lookup_zip(address: str) -> str:
+    """從地址比對郵遞區號，找不到回傳空字串"""
     if not address:
-        return "缺少地址"
-    zip3 = address[:3]
-    if zip3 in ZIP_DICT:
-        return "正常"
-    return "缺少/錯誤郵遞區號"
+        return ""
+    for code, region in ZIP_DICT.items():
+        if region and region in address:
+            return code
+    return ""
 
 # ====== 將一筆訂單寫入 Google Sheets ======
 def append_order_row(
@@ -99,13 +95,17 @@ def append_order_row(
     託運單號="", 備註="", 資料檢核狀態=""
 ):
     record_id = make_record_id()
+    zip_code = lookup_zip(寄送地址)
+    final_address = f"{zip_code} {寄送地址}" if zip_code else safe_text(寄送地址)
+    status = "正常" if zip_code else "無法自動補郵遞區號"
+
     row = [
         record_id,                 # 1 紀錄ID
         now_tpe_str(),             # 2 建單日期
         safe_text(建單人),         # 3 建單人
         safe_text(學員姓名),       # 4 學員姓名
         normalize_phone(學員電話), # 5 學員電話
-        safe_text(寄送地址),       # 6 寄送地址
+        final_address,             # 6 寄送地址（自動補郵遞區號）
         safe_text(書籍名稱),       # 7 書籍名稱
         safe_text(語別),           # 8 語別
         safe_text(寄送方式),       # 9 寄送方式
@@ -113,7 +113,7 @@ def append_order_row(
         safe_text(託運單號),       # 11 託運單號
         infer_status(寄出日期),     # 12 寄送狀態
         safe_text(備註),           # 13 備註
-        check_zip(寄送地址)        # 14 資料檢核狀態
+        status                     # 14 資料檢核狀態
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
     print(f"[Sheets] Append row success: {row}")
@@ -209,7 +209,7 @@ def sheets_test():
         建單人="測試用",
         學員姓名="王小明",
         學員電話="0912345678",
-        寄送地址="406 台中市北屯區文心路四段100號10樓",
+        寄送地址="台中市北屯區文心路四段100號",
         書籍名稱="Let's Go 5（第五版）",
         備註="這是一筆測試"
     )
@@ -249,7 +249,7 @@ def callback():
                         "#寄書需求\n"
                         "學員姓名：王小明\n"
                         "學員電話：0912-345-678\n"
-                        "寄送地址：406 台中市北屯區…\n"
+                        "寄送地址：台中市北屯區…\n"
                         "書籍名稱：\n- Let's Go 5（第五版）"
                     )
                     reply = f"❌ 缺少欄位：{ '、'.join(missing) }\n\n{example}"
