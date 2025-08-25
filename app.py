@@ -2,6 +2,7 @@ from flask import Flask, request, abort
 import gspread
 from google.oauth2.service_account import Credentials
 import os, re, difflib, json
+from datetime import datetime
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -31,31 +32,18 @@ def _build_gspread_client():
 
 GC = _build_gspread_client()
 
-# =====★ 分頁名稱改為可設定，並給出合理預設 =====
-MAIN_SHEET_NAME = os.getenv("MAIN_SHEET_NAME", "寄書任務")        # 你的主資料分頁（以前硬寫成 工作表1）
+# ===== 分頁名稱（用環境變數控制，避免名稱不一致） =====
+MAIN_SHEET_NAME = os.getenv("MAIN_SHEET_NAME", "寄書任務")
 ZIP_SHEET_NAME  = os.getenv("ZIP_SHEET_NAME", "郵遞區號參照表")
-BOOK_SHEET_NAME = os.getenv("BOOK_SHEET_NAME", "書目主檔")        # B=書名, K=別名
+BOOK_SHEET_NAME = os.getenv("BOOK_SHEET_NAME", "書目主檔")
 
-# 啟動時列出所有分頁，方便對照（看 Railway Deploy Logs）
 _spread = GC.open_by_key(SHEET_ID)
 _titles = [ws.title for ws in _spread.worksheets()]
 print("=== DEBUG: Worksheets found ===", _titles)
 
-# 明確打開分頁，不存在就丟出清楚錯誤（避免隱性崩潰）
-try:
-    MAIN_WS = _spread.worksheet(MAIN_SHEET_NAME)
-except gspread.exceptions.WorksheetNotFound as e:
-    raise RuntimeError(f"找不到主分頁：{MAIN_SHEET_NAME}，目前活頁簿分頁有：{_titles}")
-
-try:
-    ZIP_WS  = _spread.worksheet(ZIP_SHEET_NAME)
-except gspread.exceptions.WorksheetNotFound as e:
-    raise RuntimeError(f"找不到郵遞區號分頁：{ZIP_SHEET_NAME}，目前活頁簿分頁有：{_titles}")
-
-try:
-    BOOK_WS = _spread.worksheet(BOOK_SHEET_NAME)
-except gspread.exceptions.WorksheetNotFound as e:
-    raise RuntimeError(f"找不到書目主檔分頁：{BOOK_SHEET_NAME}，目前活頁簿分頁有：{_titles}")
+MAIN_WS = _spread.worksheet(MAIN_SHEET_NAME)
+ZIP_WS  = _spread.worksheet(ZIP_SHEET_NAME)
+BOOK_WS = _spread.worksheet(BOOK_SHEET_NAME)
 
 # ===== LINE Bot =====
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -63,7 +51,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ===== 使用者暫存狀態（不綁秒數；每位使用者獨立）=====
+# ===== 使用者暫存狀態 =====
 PENDING = {}
 CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
 CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N", "取消作業", "重新輸入"}
@@ -95,7 +83,7 @@ def is_full_form_message(txt: str) -> bool:
     return all([data["name"], data["phone"], data["address"], data["book"]])
 
 def validate_phone(p: str):
-    digits = re.sub(r"\D", "", p)  # 允許 0912-345-678 等符號，統一抽數字
+    digits = re.sub(r"\D", "", p)  # 去掉非數字
     return bool(re.fullmatch(r"09\d{8}", digits))
 
 def validate_address(a: str):
@@ -128,20 +116,16 @@ def resolve_book(user_book: str):
     titles, alias2title, candidates = load_book_index()
     if not user_book:
         return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
-
     if user_book in titles:
         return True, user_book, "", False
-
     if user_book in alias2title:
         return True, alias2title[user_book], "", False
-
     matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
     if matches:
         m = matches[0]
         canonical = alias2title.get(m, m)
         msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
         return False, canonical, msg, True
-
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
 
 def find_zipcode(address: str):
@@ -151,8 +135,20 @@ def find_zipcode(address: str):
             return rec.get("郵遞區號", "")
     return ""
 
+# ★ 修正版 append_row：依照你表格欄位順序塞值
 def append_row(name, phone, address, zipcode, book):
-    MAIN_WS.append_row([name, phone, address, zipcode, book])
+    today = datetime.today().strftime("%Y-%m-%d")
+    row = [
+        "",          # A 紀錄ID
+        today,       # B 建單日期
+        "LINE Bot",  # C 建單人
+        name,        # D 學員姓名
+        phone,       # E 學員電話
+        address,     # F 寄送地址
+        book,        # G 書籍名稱
+        "", "", "", "", "", "", ""  # H~N 空白
+    ]
+    MAIN_WS.append_row(row)
 
 def start_pending(user_id: str, p_type: str, data: dict, context: dict):
     PENDING[user_id] = {"type": p_type, "data": data, "context": context}
