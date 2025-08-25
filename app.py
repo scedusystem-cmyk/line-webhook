@@ -25,7 +25,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ===== 使用者確認暫存 (5 分鐘有效) =====
-# 格式: user_id -> {"expires": ts, "data": {name, phone, address, book}, "suggested": canonical_book}
+# user_id -> {"expires": ts, "data": {name, phone, address, book}, "suggested": canonical_book}
 PENDING = {}
 CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
 CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N"}
@@ -42,7 +42,6 @@ def parse_input(txt: str):
     phone = re.search(r"電話[:：]?\s*(\d+)", txt)
     addr = re.search(r"地址[:：]?\s*(.+?)(書|書籍|$)", txt)
     book = re.search(r"(?:書|書籍)[:：]?\s*([\S ]+)", txt)
-
     return {
         "name": name.group(1).strip() if name else "",
         "phone": phone.group(1).strip() if phone else "",
@@ -59,18 +58,15 @@ def validate_address(a: str):
 def load_book_index():
     """
     回傳:
-      titles: set(正式書名)
-      alias2title: dict(別名 -> 正式書名)
-      candidates: list(可比對集合: 正式書名 + 別名)
+      titles: set(正式書名, 來源B欄)
+      alias2title: dict(別名 -> 正式書名, 來源K欄)
+      candidates: list(正式+別名，用於 difflib)
     """
     rows = BOOK_WS.get_all_values()
     titles = set()
     alias2title = {}
     if not rows:
         return titles, alias2title, []
-
-    header = rows[0]
-    # B欄=1, K欄=10 (0-based)
     for r in rows[1:]:
         if not r:
             continue
@@ -78,41 +74,38 @@ def load_book_index():
         if not title:
             continue
         titles.add(title)
-
         alias_raw = r[10].strip() if len(r) > 10 else ""
         if alias_raw:
-            # 以逗號/斜線/頓號/分號/空白分割
             parts = re.split(r"[,\u3001/;| ]+", alias_raw)
             for a in parts:
                 a = a.strip()
                 if a:
                     alias2title[a] = title
-
     candidates = list(titles) + list(alias2title.keys())
     return titles, alias2title, candidates
 
 def resolve_book(user_book: str):
     """
-    書名解析與模糊比對。
+    書名解析：
+      1) 命中B欄 → 直接通過
+      2) 命中K欄(別名) → 直接映射通過
+      3) 兩者皆無 → 用 difflib 找最接近，提示並詢問 Y/N
     回傳 (ok, canonical_title, msg_for_user, need_confirm)
     """
     titles, alias2title, candidates = load_book_index()
     if not user_book:
         return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
 
-    # 完全匹配正式書名
     if user_book in titles:
         return True, user_book, "", False
 
-    # 完全匹配別名 → 對應到正式書名
     if user_book in alias2title:
         return True, alias2title[user_book], "", False
 
-    # 模糊比對 (含正式與別名)
     matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
     if matches:
         m = matches[0]
-        canonical = alias2title.get(m, m)  # 如果命中別名，映射到正式書名
+        canonical = alias2title.get(m, m)  # 別名→正式
         msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
         return False, canonical, msg, True
 
@@ -121,7 +114,6 @@ def resolve_book(user_book: str):
 def find_zipcode(address: str):
     records = ZIP_WS.get_all_records()
     for rec in records:
-        # 假設參照表包含欄位名為「地區」與「郵遞區號」
         if rec.get("地區") and rec["地區"] in address:
             return rec.get("郵遞區號", "")
     return ""
@@ -146,15 +138,12 @@ def handle_message(event):
     text = event.message.text.strip()
     clean_expired()
 
-    # --- 先處理確認回覆 ---
+    # --- 確認流程 ---
     if user_id in PENDING:
-        # 有待確認，判斷 Y/N
         if text in CONFIRM_OK:
             info = PENDING.pop(user_id)
             data = info["data"]
             canonical_book = info["suggested"]
-
-            # 電話/地址再簡單驗證一次（理論上已驗過）
             if not validate_phone(data["phone"]):
                 line_bot_api.reply_message(event.reply_token,
                     TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
@@ -163,7 +152,6 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token,
                     TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
                 return
-
             zipcode = find_zipcode(data["address"])
             append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
             reply = (
@@ -176,24 +164,15 @@ def handle_message(event):
             )
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-
         if text in CONFIRM_NO:
             PENDING.pop(user_id, None)
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="已取消。請重新輸入：姓名、電話、地址、書籍。"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。請重新輸入：姓名、電話、地址、書籍。"))
             return
-
-        # 其他文字時，提示仍在待確認狀態
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="請回覆「Y」採用建議書名，或「N」取消。"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請回覆「Y」採用，或回覆「N」取消。"))
         return
 
-    # --- 一般輸入流程 ---
+    # --- 一般輸入 ---
     data = parse_input(text)
-
-    # 基本驗證
     if not data["name"]:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請提供姓名。"))
         return
@@ -207,16 +186,14 @@ def handle_message(event):
     ok, canonical_book, msg, need_confirm = resolve_book(data["book"])
     if not ok:
         if need_confirm:
-            # 進入待確認狀態
             PENDING[user_id] = {
-                "expires": time.time() + 300,  # 5 分鐘
+                "expires": time.time() + 300,
                 "data": data,
                 "suggested": canonical_book
             }
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
-    # 全部通過，直接建檔
     zipcode = find_zipcode(data["address"])
     append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
     reply = (
