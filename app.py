@@ -1,289 +1,233 @@
-# app.py — LINE Bot + Google Sheets 寫入（寄書任務 + 自動補郵遞區號）
-import os, json, datetime, re
-from flask import Flask, request, abort, jsonify
-
-# ----- LINE SDK -----
-from linebot import LineBotApi, WebhookParser
+from flask import Flask, request, abort
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import os, re, time, difflib
+from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ----- Google Sheets -----
-import gspread
-from google.oauth2.service_account import Credentials
-
 app = Flask(__name__)
 
-# ====== LINE 基本設定 ======
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    print("[WARN] Missing LINE env vars.")
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN) if CHANNEL_ACCESS_TOKEN else None
-parser = WebhookParser(CHANNEL_SECRET) if CHANNEL_SECRET else None
+# ===== Google Sheets 連線 =====
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDS = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", SCOPE)
+GC = gspread.authorize(CREDS)
+SHEET_ID = os.getenv("SHEET_ID")
 
-# ====== Google Sheets 連線設定 ======
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-service_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-creds = Credentials.from_service_account_info(service_info, scopes=SCOPES)
-gc = gspread.authorize(creds)
+MAIN_WS = GC.open_by_key(SHEET_ID).worksheet("工作表1")
+ZIP_WS = GC.open_by_key(SHEET_ID).worksheet("郵遞區號參照表")
+BOOK_WS = GC.open_by_key(SHEET_ID).worksheet("書目主檔")  # B=書籍名稱, K=模糊比對書名(別名)
 
-SHEET_ID = os.environ["SHEET_ID"]
-SHEET_NAME = os.environ.get("SHEET_NAME", "寄書任務")
-sh = gc.open_by_key(SHEET_ID)
-ws = sh.worksheet(SHEET_NAME)
+# ===== LINE Bot =====
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ====== 小工具 ======
-def now_tpe_str():
-    return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+# ===== 使用者確認暫存 (5 分鐘有效) =====
+# 格式: user_id -> {"expires": ts, "data": {name, phone, address, book}, "suggested": canonical_book}
+PENDING = {}
+CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
+CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N"}
 
-def make_record_id():
-    ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=8))
-    return "SJREQ-" + ts.strftime("%Y%m%d-%H%M%S")
+# ===== 工具函式 =====
+def clean_expired():
+    now = time.time()
+    for uid in list(PENDING.keys()):
+        if PENDING[uid]["expires"] < now:
+            del PENDING[uid]
 
-def infer_status(ship_date: str) -> str:
-    return "已寄送完成" if ship_date and str(ship_date).strip() else "未寄出"
+def parse_input(txt: str):
+    name = re.search(r"姓名[:：]?\s*([\S]+)", txt)
+    phone = re.search(r"電話[:：]?\s*(\d+)", txt)
+    addr = re.search(r"地址[:：]?\s*(.+?)(書|書籍|$)", txt)
+    book = re.search(r"(?:書|書籍)[:：]?\s*([\S ]+)", txt)
 
-def normalize_phone(p: str) -> str:
-    return "".join(ch for ch in (p or "") if ch.isdigit())
+    return {
+        "name": name.group(1).strip() if name else "",
+        "phone": phone.group(1).strip() if phone else "",
+        "address": addr.group(1).strip() if addr else "",
+        "book": book.group(1).strip() if book else ""
+    }
 
-def safe_text(x):
-    return x if x is not None else ""
+def validate_phone(p: str):
+    return bool(re.match(r"^09\d{8}$", p))
 
-def get_display_name_from_event(event) -> str:
-    try:
-        if event.source.type == "group":
-            return line_bot_api.get_group_member_profile(event.source.group_id, event.source.user_id).display_name
-        elif event.source.type == "room":
-            return line_bot_api.get_room_member_profile(event.source.room_id, event.source.user_id).display_name
-        else:
-            return line_bot_api.get_profile(event.source.user_id).display_name
-    except Exception:
-        return "未知使用者"
+def validate_address(a: str):
+    return ("縣" in a) or ("市" in a)
 
-# ====== 郵遞區號參照表 ======
-def load_zip_dict():
-    try:
-        zip_ws = sh.worksheet("郵遞區號參照表")
-        data = zip_ws.get_all_records()  # [{'地區': '中正區', '郵遞區號': 100}, ...]
-        zip_dict = {}
-        for row in data:
-            code = str(row.get("郵遞區號", "")).strip()
-            name = str(row.get("地區", "")).strip()
-            if code and name:
-                zip_dict[code] = name
-        print(f"[INFO] 已載入 {len(zip_dict)} 筆郵遞區號")
-        return zip_dict
-    except Exception as e:
-        print("[WARN] 無法載入郵遞區號參照表:", e)
-        return {}
+def load_book_index():
+    """
+    回傳:
+      titles: set(正式書名)
+      alias2title: dict(別名 -> 正式書名)
+      candidates: list(可比對集合: 正式書名 + 別名)
+    """
+    rows = BOOK_WS.get_all_values()
+    titles = set()
+    alias2title = {}
+    if not rows:
+        return titles, alias2title, []
 
-ZIP_DICT = load_zip_dict()
+    header = rows[0]
+    # B欄=1, K欄=10 (0-based)
+    for r in rows[1:]:
+        if not r:
+            continue
+        title = r[1].strip() if len(r) > 1 else ""
+        if not title:
+            continue
+        titles.add(title)
 
-def lookup_zip(address: str) -> str:
-    """從地址比對郵遞區號，找不到回傳空字串"""
-    if not address:
-        return ""
-    for code, region in ZIP_DICT.items():
-        if region and region in address:
-            return code
+        alias_raw = r[10].strip() if len(r) > 10 else ""
+        if alias_raw:
+            # 以逗號/斜線/頓號/分號/空白分割
+            parts = re.split(r"[,\u3001/;| ]+", alias_raw)
+            for a in parts:
+                a = a.strip()
+                if a:
+                    alias2title[a] = title
+
+    candidates = list(titles) + list(alias2title.keys())
+    return titles, alias2title, candidates
+
+def resolve_book(user_book: str):
+    """
+    書名解析與模糊比對。
+    回傳 (ok, canonical_title, msg_for_user, need_confirm)
+    """
+    titles, alias2title, candidates = load_book_index()
+    if not user_book:
+        return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
+
+    # 完全匹配正式書名
+    if user_book in titles:
+        return True, user_book, "", False
+
+    # 完全匹配別名 → 對應到正式書名
+    if user_book in alias2title:
+        return True, alias2title[user_book], "", False
+
+    # 模糊比對 (含正式與別名)
+    matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
+    if matches:
+        m = matches[0]
+        canonical = alias2title.get(m, m)  # 如果命中別名，映射到正式書名
+        msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
+        return False, canonical, msg, True
+
+    return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
+
+def find_zipcode(address: str):
+    records = ZIP_WS.get_all_records()
+    for rec in records:
+        # 假設參照表包含欄位名為「地區」與「郵遞區號」
+        if rec.get("地區") and rec["地區"] in address:
+            return rec.get("郵遞區號", "")
     return ""
 
-# ====== 將一筆訂單寫入 Google Sheets ======
-def append_order_row(
-    建單人, 學員姓名, 學員電話, 寄送地址,
-    書籍名稱, 語別="", 寄送方式="", 寄出日期="",
-    託運單號="", 備註="", 資料檢核狀態=""
-):
-    record_id = make_record_id()
-    zip_code = lookup_zip(寄送地址)
-    final_address = f"{zip_code} {寄送地址}" if zip_code else safe_text(寄送地址)
-    status = "正常" if zip_code else "無法自動補郵遞區號"
+def append_row(name, phone, address, zipcode, book):
+    MAIN_WS.append_row([name, phone, address, zipcode, book])
 
-    row = [
-        record_id,                 # 1 紀錄ID
-        now_tpe_str(),             # 2 建單日期
-        safe_text(建單人),         # 3 建單人
-        safe_text(學員姓名),       # 4 學員姓名
-        normalize_phone(學員電話), # 5 學員電話
-        final_address,             # 6 寄送地址（自動補郵遞區號）
-        safe_text(書籍名稱),       # 7 書籍名稱
-        safe_text(語別),           # 8 語別
-        safe_text(寄送方式),       # 9 寄送方式
-        safe_text(寄出日期),       # 10 寄出日期
-        safe_text(託運單號),       # 11 託運單號
-        infer_status(寄出日期),     # 12 寄送狀態
-        safe_text(備註),           # 13 備註
-        status                     # 14 資料檢核狀態
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    print(f"[Sheets] Append row success: {row}")
-    return record_id
-
-# ====== 欄位同義詞對照 ======
-FIELD_ALIASES = {
-    "學員姓名": ["學員姓名", "姓名", "名字"],
-    "學員電話": ["學員電話", "電話", "手機"],
-    "寄送地址": ["寄送地址", "地址", "住址"],
-    "書籍名稱": ["書籍名稱", "書", "教材", "課本"],
-    "備註": ["備註", "備考", "說明"]
-}
-
-def normalize_field_key(key: str) -> str:
-    for std, aliases in FIELD_ALIASES.items():
-        if key in aliases:
-            return std
-    return key
-
-# ====== 解析「#寄書需求」訊息 ======
-def parse_order_text(text: str):
-    result = {"學員姓名": "", "學員電話": "", "寄送地址": "", "備註": "", "書籍清單": []}
-    if not text:
-        return result
-
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-
-    if not any("#寄書需求" in ln for ln in lines):
-        return result
-    start_idx = 0
-    for i, ln in enumerate(lines):
-        if "#寄書需求" in ln:
-            start_idx = i + 1
-            break
-    lines = lines[start_idx:]
-
-    buffer_books = []
-    current_field = None
-    for ln in lines:
-        if re.match(r"^[-•・]\s*", ln):
-            val = re.sub(r"^[-•・]\s*", "", ln)
-            if val:
-                buffer_books.append(val)
-            continue
-
-        m = re.match(r"^([^：:]+)\s*[：:]\s*(.*)$", ln)
-        if m:
-            key = normalize_field_key(m.group(1).strip())
-            val = m.group(2).strip()
-            current_field = None
-
-            if key == "學員姓名":
-                result["學員姓名"] = val
-            elif key == "學員電話":
-                result["學員電話"] = val
-            elif key == "寄送地址":
-                result["寄送地址"] = val
-            elif key == "書籍名稱":
-                if val:
-                    buffer_books.append(val)
-                current_field = "書籍名稱"
-            elif key == "備註":
-                result["備註"] = val if result["備註"] == "" else (result["備註"] + "；" + val)
-            else:
-                extra = f"{key}：{val}"
-                result["備註"] = extra if result["備註"] == "" else (result["備註"] + "；" + extra)
-            continue
-
-        if current_field == "書籍名稱" and ln:
-            buffer_books.append(ln)
-
-    result["書籍清單"] = [bk for bk in [b.strip() for b in buffer_books] if bk]
-    return result
-
-def check_required_fields(parsed: dict):
-    missing = []
-    if not parsed.get("學員姓名"): missing.append("學員姓名")
-    if not parsed.get("學員電話"): missing.append("學員電話")
-    if not parsed.get("寄送地址"): missing.append("寄送地址")
-    if not parsed.get("書籍清單"): missing.append("書籍名稱")
-    return missing
-
-# ====== 健康檢查 ======
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
-
-# ====== 測試寫入 ======
-@app.get("/sheets/test")
-def sheets_test():
-    rid = append_order_row(
-        建單人="測試用",
-        學員姓名="王小明",
-        學員電話="0912345678",
-        寄送地址="台中市北屯區文心路四段100號",
-        書籍名稱="Let's Go 5（第五版）",
-        備註="這是一筆測試"
-    )
-    return jsonify({"ok": True, "record_id": rid})
-
-# ====== LINE Webhook ======
-@app.route("/callback", methods=["GET", "HEAD", "POST"])
+# ===== Webhook =====
+@app.route("/callback", methods=["POST"])
 def callback():
-    if request.method in ("GET", "HEAD"):
-        return "OK", 200
-
-    signature = request.headers.get("X-Line-Signature")
-    if not signature:
-        return "OK", 200
-
-    if parser is None or line_bot_api is None:
-        abort(500)
-
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
     try:
-        events = parser.parse(body, signature)
+        handler.handle(body, signature)
     except InvalidSignatureError:
-        print("[WARN] Invalid signature on /callback")
-        return "OK", 200
+        abort(400)
+    return "OK"
 
-    for event in events:
-        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
-            text = event.message.text.strip()
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_id = event.source.user_id
+    text = event.message.text.strip()
+    clean_expired()
 
-            if "#寄書需求" in text:
-                parsed = parse_order_text(text)
-                missing = check_required_fields(parsed)
-                if missing:
-                    example = (
-                        "請依格式補齊：\n"
-                        "#寄書需求\n"
-                        "學員姓名：王小明\n"
-                        "學員電話：0912-345-678\n"
-                        "寄送地址：台中市北屯區…\n"
-                        "書籍名稱：\n- Let's Go 5（第五版）"
-                    )
-                    reply = f"❌ 缺少欄位：{ '、'.join(missing) }\n\n{example}"
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                    continue
+    # --- 先處理確認回覆 ---
+    if user_id in PENDING:
+        # 有待確認，判斷 Y/N
+        if text in CONFIRM_OK:
+            info = PENDING.pop(user_id)
+            data = info["data"]
+            canonical_book = info["suggested"]
 
-                creator = get_display_name_from_event(event)
-                rids = []
-                for book in parsed["書籍清單"]:
-                    rid = append_order_row(
-                        建單人=creator,
-                        學員姓名=parsed["學員姓名"],
-                        學員電話=parsed["學員電話"],
-                        寄送地址=parsed["寄送地址"],
-                        書籍名稱=book,
-                        備註=parsed.get("備註", "")
-                    )
-                    rids.append(rid)
+            # 電話/地址再簡單驗證一次（理論上已驗過）
+            if not validate_phone(data["phone"]):
+                line_bot_api.reply_message(event.reply_token,
+                    TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
+                return
+            if not validate_address(data["address"]):
+                line_bot_api.reply_message(event.reply_token,
+                    TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
+                return
 
-                books_preview = "\n- " + "\n- ".join(parsed["書籍清單"])
-                reply = (
-                    f"✅ 已建立寄書需求（{len(rids)} 筆）：\n"
-                    f"學員：{parsed['學員姓名']}\n"
-                    f"書名：{books_preview}\n"
-                    f"紀錄ID：\n" + "\n".join(rids)
-                )
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                continue
-
-            reply = f"你說：{text}"
+            zipcode = find_zipcode(data["address"])
+            append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
+            reply = (
+                "✅ 已採用建議書名並建檔：\n"
+                f"姓名：{data['name']}\n"
+                f"電話：{data['phone']}\n"
+                f"地址：{data['address']}\n"
+                f"郵遞區號：{zipcode}\n"
+                f"書籍：{canonical_book}"
+            )
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
 
-    return "OK", 200
+        if text in CONFIRM_NO:
+            PENDING.pop(user_id, None)
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="已取消。請重新輸入：姓名、電話、地址、書籍。"))
+            return
 
-# ====== 啟動 ======
+        # 其他文字時，提示仍在待確認狀態
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="請回覆「Y」採用建議書名，或「N」取消。"))
+        return
+
+    # --- 一般輸入流程 ---
+    data = parse_input(text)
+
+    # 基本驗證
+    if not data["name"]:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請提供姓名。"))
+        return
+    if not validate_phone(data["phone"]):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤（例：0912345678）。"))
+        return
+    if not validate_address(data["address"]):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址需包含「縣」或「市」，請確認。"))
+        return
+
+    ok, canonical_book, msg, need_confirm = resolve_book(data["book"])
+    if not ok:
+        if need_confirm:
+            # 進入待確認狀態
+            PENDING[user_id] = {
+                "expires": time.time() + 300,  # 5 分鐘
+                "data": data,
+                "suggested": canonical_book
+            }
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return
+
+    # 全部通過，直接建檔
+    zipcode = find_zipcode(data["address"])
+    append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
+    reply = (
+        "✅ 已成功建檔：\n"
+        f"姓名：{data['name']}\n"
+        f"電話：{data['phone']}\n"
+        f"地址：{data['address']}\n"
+        f"郵遞區號：{zipcode}\n"
+        f"書籍：{canonical_book}"
+    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
