@@ -1,7 +1,7 @@
 from flask import Flask, request, abort
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import os, re, time, difflib
+import os, re, difflib
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -24,23 +24,29 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ===== 使用者確認暫存 (5 分鐘有效) =====
+# ===== 使用者暫存狀態 =====
+# 結構: user_id -> {"type": "confirm_suggestion", "data": {...}, "context": {...}}
 PENDING = {}
 CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
-CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N"}
+CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N", "取消作業", "重新輸入"}
 
 # ===== 工具函式 =====
-def clean_expired():
-    now = time.time()
-    for uid in list(PENDING.keys()):
-        if PENDING[uid]["expires"] < now:
-            del PENDING[uid]
-
 def parse_input(txt: str):
-    name = re.search(r"姓名[:：]?\s*([\S]+)", txt)
-    phone = re.search(r"電話[:：]?\s*([\d\-\s\(\)]+)", txt)  # 允許帶符號
-    addr = re.search(r"地址[:：]?\s*(.+?)(書|書籍|$)", txt)
-    book = re.search(r"(?:書|書籍)[:：]?\s*([\S ]+)", txt)
+    # 忽略 #寄書需求 抬頭
+    lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("#")]
+    txt = "\n".join(lines)
+
+    # 支援別名欄位
+    name_pat    = r"(?:學員)?姓名[:：]?\s*([^\n]+)"
+    phone_pat   = r"(?:學員)?電話[:：]?\s*([0-9\-\s\(\)]+)"
+    address_pat = r"(?:寄送)?地址[:：]?\s*([^\n]+)"
+    book_pat    = r"(?:書籍名稱|書籍|書)[:：]?\s*([^\n]+)"
+
+    name = re.search(name_pat, txt)
+    phone = re.search(phone_pat, txt)
+    addr = re.search(address_pat, txt)
+    book = re.search(book_pat, txt)
+
     return {
         "name": name.group(1).strip() if name else "",
         "phone": phone.group(1).strip() if phone else "",
@@ -48,9 +54,12 @@ def parse_input(txt: str):
         "book": book.group(1).strip() if book else ""
     }
 
+def is_full_form_message(txt: str) -> bool:
+    data = parse_input(txt)
+    return all([data["name"], data["phone"], data["address"], data["book"]])
+
 def validate_phone(p: str):
-    # 去掉所有非數字（例如 - 空格 ( )）
-    digits = re.sub(r"\D", "", p)
+    digits = re.sub(r"\D", "", p)  # 去掉非數字
     return bool(re.fullmatch(r"09\d{8}", digits))
 
 def validate_address(a: str):
@@ -94,7 +103,7 @@ def resolve_book(user_book: str):
     if matches:
         m = matches[0]
         canonical = alias2title.get(m, m)
-        msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
+        msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或「N」取消。"
         return False, canonical, msg, True
 
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
@@ -108,6 +117,13 @@ def find_zipcode(address: str):
 
 def append_row(name, phone, address, zipcode, book):
     MAIN_WS.append_row([name, phone, address, zipcode, book])
+
+def start_pending(user_id: str, p_type: str, data: dict, context: dict):
+    PENDING[user_id] = {"type": p_type, "data": data, "context": context}
+
+def clear_pending(user_id: str):
+    if user_id in PENDING:
+        del PENDING[user_id]
 
 # ===== Webhook =====
 @app.route("/callback", methods=["POST"])
@@ -124,46 +140,72 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-    clean_expired()
 
-    # --- 確認流程 ---
+    # === 如果在暫存狀態 ===
     if user_id in PENDING:
-        if text in CONFIRM_OK:
-            info = PENDING.pop(user_id)
-            data = info["data"]
-            canonical_book = info["suggested"]
-            if not validate_phone(data["phone"]):
-                line_bot_api.reply_message(event.reply_token,
-                    TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
+        # 新表單 → 視為新案件，清掉舊的
+        if text.startswith("#寄書需求") or is_full_form_message(text):
+            clear_pending(user_id)
+        else:
+            # 等書名確認
+            if text in CONFIRM_OK and PENDING[user_id]["type"] == "confirm_suggestion":
+                info = PENDING.pop(user_id)
+                data = info["data"]
+                canonical_book = info["context"]["suggested_book"]
+
+                if not validate_phone(data["phone"]):
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
+                    return
+                if not validate_address(data["address"]):
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
+                    return
+
+                zipcode = find_zipcode(data["address"])
+                append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
+                reply = (
+                    "✅ 已採用建議書名並建檔：\n"
+                    f"姓名：{data['name']}\n"
+                    f"電話：{data['phone']}\n"
+                    f"地址：{data['address']}\n"
+                    f"郵遞區號：{zipcode}\n"
+                    f"書籍：{canonical_book}"
+                )
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                 return
-            if not validate_address(data["address"]):
-                line_bot_api.reply_message(event.reply_token,
-                    TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
+
+            if text in CONFIRM_NO:
+                clear_pending(user_id)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。若要重新申請請直接貼上完整資料。"))
                 return
-            zipcode = find_zipcode(data["address"])
-            append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
-            reply = (
-                "✅ 已採用建議書名並建檔：\n"
-                f"姓名：{data['name']}\n"
-                f"電話：{data['phone']}\n"
-                f"地址：{data['address']}\n"
-                f"郵遞區號：{zipcode}\n"
-                f"書籍：{canonical_book}"
+
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="目前等待確認中：請回覆「Y」採用、或「取消」。\n或直接貼上完整表單來重新送單。")
             )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-        if text in CONFIRM_NO:
-            PENDING.pop(user_id, None)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。請重新輸入：姓名、電話、地址、書籍。"))
-            return
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請回覆「Y」採用，或回覆「N」取消。"))
+
+    # === 一般流程 ===
+    data = parse_input(text)
+
+    # 缺漏提示
+    missing = []
+    if not data["name"]:    missing.append("學員姓名")
+    if not data["phone"]:   missing.append("學員電話")
+    if not data["address"]: missing.append("寄送地址")
+    if not data["book"]:    missing.append("書籍名稱")
+    if missing:
+        need = "、".join(missing)
+        demo = (
+            "請依格式補齊：\n"
+            "#寄書需求\n"
+            "學員姓名：王小明\n"
+            "學員電話：0912-345-678\n"
+            "寄送地址：台中市西屯區至善路250號\n"
+            "書籍名稱：Let's Go 5（第五版）"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 缺少欄位：{need}\n\n{demo}"))
         return
 
-    # --- 一般輸入 ---
-    data = parse_input(text)
-    if not data["name"]:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 請提供姓名。"))
-        return
     if not validate_phone(data["phone"]):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤（例：0912345678）。"))
         return
@@ -174,11 +216,7 @@ def handle_message(event):
     ok, canonical_book, msg, need_confirm = resolve_book(data["book"])
     if not ok:
         if need_confirm:
-            PENDING[user_id] = {
-                "expires": time.time() + 300,
-                "data": data,
-                "suggested": canonical_book
-            }
+            start_pending(user_id, "confirm_suggestion", data, {"suggested_book": canonical_book})
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
