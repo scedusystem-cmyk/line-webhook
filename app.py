@@ -25,7 +25,6 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ===== 使用者確認暫存 (5 分鐘有效) =====
-# user_id -> {"expires": ts, "data": {name, phone, address, book}, "suggested": canonical_book}
 PENDING = {}
 CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
 CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N"}
@@ -39,7 +38,7 @@ def clean_expired():
 
 def parse_input(txt: str):
     name = re.search(r"姓名[:：]?\s*([\S]+)", txt)
-    phone = re.search(r"電話[:：]?\s*(\d+)", txt)
+    phone = re.search(r"電話[:：]?\s*([\d\-\s\(\)]+)", txt)  # 允許帶符號
     addr = re.search(r"地址[:：]?\s*(.+?)(書|書籍|$)", txt)
     book = re.search(r"(?:書|書籍)[:：]?\s*([\S ]+)", txt)
     return {
@@ -50,18 +49,14 @@ def parse_input(txt: str):
     }
 
 def validate_phone(p: str):
-    return bool(re.match(r"^09\d{8}$", p))
+    # 去掉所有非數字（例如 - 空格 ( )）
+    digits = re.sub(r"\D", "", p)
+    return bool(re.fullmatch(r"09\d{8}", digits))
 
 def validate_address(a: str):
     return ("縣" in a) or ("市" in a)
 
 def load_book_index():
-    """
-    回傳:
-      titles: set(正式書名, 來源B欄)
-      alias2title: dict(別名 -> 正式書名, 來源K欄)
-      candidates: list(正式+別名，用於 difflib)
-    """
     rows = BOOK_WS.get_all_values()
     titles = set()
     alias2title = {}
@@ -85,13 +80,6 @@ def load_book_index():
     return titles, alias2title, candidates
 
 def resolve_book(user_book: str):
-    """
-    書名解析：
-      1) 命中B欄 → 直接通過
-      2) 命中K欄(別名) → 直接映射通過
-      3) 兩者皆無 → 用 difflib 找最接近，提示並詢問 Y/N
-    回傳 (ok, canonical_title, msg_for_user, need_confirm)
-    """
     titles, alias2title, candidates = load_book_index()
     if not user_book:
         return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
@@ -105,7 +93,7 @@ def resolve_book(user_book: str):
     matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
     if matches:
         m = matches[0]
-        canonical = alias2title.get(m, m)  # 別名→正式
+        canonical = alias2title.get(m, m)
         msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
         return False, canonical, msg, True
 
