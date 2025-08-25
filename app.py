@@ -9,7 +9,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ===== Google Sheets 連線（支援檔案或環境變數） =====
+# ===== Google Sheets 連線 =====
 SHEET_ID = os.getenv("SHEET_ID", "")
 
 SCOPES = [
@@ -32,7 +32,7 @@ def _build_gspread_client():
 
 GC = _build_gspread_client()
 
-# ===== 分頁名稱（用環境變數控制，避免名稱不一致） =====
+# ===== 分頁名稱 =====
 MAIN_SHEET_NAME = os.getenv("MAIN_SHEET_NAME", "寄書任務")
 ZIP_SHEET_NAME  = os.getenv("ZIP_SHEET_NAME", "郵遞區號參照表")
 BOOK_SHEET_NAME = os.getenv("BOOK_SHEET_NAME", "書目主檔")
@@ -51,10 +51,10 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ===== 使用者暫存狀態 =====
+# ===== 暫存狀態 =====
 PENDING = {}
-CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
-CONFIRM_NO = {"n", "no", "否", "不要", "取消", "N", "取消作業", "重新輸入"}
+CONFIRM_OK = {"y","yes","是","好","ok","確認","對","Y","OK","Ok"}
+CONFIRM_NO = {"n","no","否","不要","取消","N","取消作業","重新輸入"}
 
 # ===== 工具函式 =====
 def parse_input(txt: str):
@@ -83,8 +83,8 @@ def is_full_form_message(txt: str) -> bool:
     return all([data["name"], data["phone"], data["address"], data["book"]])
 
 def validate_phone(p: str):
-    digits = re.sub(r"\D", "", p)  # 去掉非數字
-    return bool(re.fullmatch(r"09\d{8}", digits))
+    digits = re.sub(r"\D", "", p)  # 清除非數字
+    return digits if re.fullmatch(r"09\d{8}", digits) else None
 
 def validate_address(a: str):
     return ("縣" in a) or ("市" in a)
@@ -116,16 +116,19 @@ def resolve_book(user_book: str):
     titles, alias2title, candidates = load_book_index()
     if not user_book:
         return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
+
     if user_book in titles:
         return True, user_book, "", False
     if user_book in alias2title:
         return True, alias2title[user_book], "", False
+
     matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
     if matches:
         m = matches[0]
         canonical = alias2title.get(m, m)
         msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
         return False, canonical, msg, True
+
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
 
 def find_zipcode(address: str):
@@ -135,17 +138,16 @@ def find_zipcode(address: str):
             return rec.get("郵遞區號", "")
     return ""
 
-# ★ 修正版 append_row：依照你表格欄位順序塞值
-def append_row(name, phone, address, zipcode, book):
+def append_row(record_id, sender_name, name, phone, address, zipcode, book):
     today = datetime.today().strftime("%Y-%m-%d")
     row = [
-        "",          # A 紀錄ID
-        today,       # B 建單日期
-        "LINE Bot",  # C 建單人
-        name,        # D 學員姓名
-        phone,       # E 學員電話
-        address,     # F 寄送地址
-        book,        # G 書籍名稱
+        record_id,    # A 紀錄ID
+        today,        # B 建單日期
+        sender_name,  # C 建單人
+        name,         # D 學員姓名
+        phone,        # E 學員電話
+        address,      # F 寄送地址
+        book,         # G 書籍名稱
         "", "", "", "", "", "", ""  # H~N 空白
     ]
     MAIN_WS.append_row(row)
@@ -182,19 +184,24 @@ def handle_message(event):
                 data = info["data"]
                 canonical_book = info["context"]["suggested_book"]
 
-                if not validate_phone(data["phone"]):
+                clean_phone = validate_phone(data["phone"])
+                if not clean_phone:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
                     return
                 if not validate_address(data["address"]):
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
                     return
 
+                profile = line_bot_api.get_profile(user_id)
+                sender_name = profile.display_name
+                record_id = len(MAIN_WS.get_all_values())
+
                 zipcode = find_zipcode(data["address"])
-                append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
+                append_row(record_id, sender_name, data["name"], clean_phone, data["address"], zipcode, canonical_book)
                 reply = (
                     "✅ 已採用建議書名並建檔：\n"
                     f"姓名：{data['name']}\n"
-                    f"電話：{data['phone']}\n"
+                    f"電話：{clean_phone}\n"
                     f"地址：{data['address']}\n"
                     f"郵遞區號：{zipcode}\n"
                     f"書籍：{canonical_book}"
@@ -226,14 +233,15 @@ def handle_message(event):
             "請依格式補齊：\n"
             "#寄書需求\n"
             "學員姓名：王小明\n"
-            "學員電話：0912-345-678\n"
+            "學員電話：0912345678\n"
             "寄送地址：台中市西屯區至善路250號\n"
             "書籍名稱：Let's Go 5（第五版）"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 缺少欄位：{need}\n\n{demo}"))
         return
 
-    if not validate_phone(data["phone"]):
+    clean_phone = validate_phone(data["phone"])
+    if not clean_phone:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤（例：0912345678）。"))
         return
     if not validate_address(data["address"]):
@@ -247,12 +255,16 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
+    profile = line_bot_api.get_profile(user_id)
+    sender_name = profile.display_name
+    record_id = len(MAIN_WS.get_all_values())
+
     zipcode = find_zipcode(data["address"])
-    append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
+    append_row(record_id, sender_name, data["name"], clean_phone, data["address"], zipcode, canonical_book)
     reply = (
         "✅ 已成功建檔：\n"
         f"姓名：{data['name']}\n"
-        f"電話：{data['phone']}\n"
+        f"電話：{clean_phone}\n"
         f"地址：{data['address']}\n"
         f"郵遞區號：{zipcode}\n"
         f"書籍：{canonical_book}"
