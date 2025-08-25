@@ -1,30 +1,54 @@
 from flask import Flask, request, abort
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import os, re, difflib
+from google.oauth2.service_account import Credentials
+import os, re, difflib, json, tempfile
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ===== Google Sheets 連線 =====
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", SCOPE)
-GC = gspread.authorize(CREDS)
-SHEET_ID = os.getenv("SHEET_ID")
+# ===== Google Sheets 連線（支援檔案或環境變數） =====
+SHEET_ID = os.getenv("SHEET_ID", "")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def _build_gspread_client():
+    # 1) 若專案目錄存在 service_account.json → 直接使用
+    json_path = "service_account.json"
+    if os.path.exists(json_path):
+        creds = Credentials.from_service_account_file(json_path, scopes=SCOPES)
+        return gspread.authorize(creds)
+
+    # 2) 否則從環境變數 GOOGLE_SERVICE_ACCOUNT_JSON 讀取
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
+        raise RuntimeError("Missing service account credentials. "
+                           "Provide service_account.json file OR set env GOOGLE_SERVICE_ACCOUNT_JSON.")
+    try:
+        info = json.loads(sa_json)
+    except Exception as e:
+        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+GC = _build_gspread_client()
 
 MAIN_WS = GC.open_by_key(SHEET_ID).worksheet("工作表1")
-ZIP_WS = GC.open_by_key(SHEET_ID).worksheet("郵遞區號參照表")
+ZIP_WS  = GC.open_by_key(SHEET_ID).worksheet("郵遞區號參照表")
 BOOK_WS = GC.open_by_key(SHEET_ID).worksheet("書目主檔")  # B=書籍名稱, K=模糊比對書名(別名)
 
 # ===== LINE Bot =====
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ===== 使用者暫存狀態 =====
+# ===== 使用者暫存狀態（不綁秒數；每位使用者獨立）=====
 # 結構: user_id -> {"type": "confirm_suggestion", "data": {...}, "context": {...}}
 PENDING = {}
 CONFIRM_OK = {"y", "yes", "是", "好", "ok", "確認", "對", "Y", "OK", "Ok"}
@@ -59,7 +83,8 @@ def is_full_form_message(txt: str) -> bool:
     return all([data["name"], data["phone"], data["address"], data["book"]])
 
 def validate_phone(p: str):
-    digits = re.sub(r"\D", "", p)  # 去掉非數字
+    # 允許 0912-345-678 / (0912)345678 等，統一抽出數字判斷
+    digits = re.sub(r"\D", "", p)
     return bool(re.fullmatch(r"09\d{8}", digits))
 
 def validate_address(a: str):
@@ -93,17 +118,20 @@ def resolve_book(user_book: str):
     if not user_book:
         return False, "", "⚠️ 書籍名稱不可為空，請重新輸入。", False
 
+    # 命中正式書名（B欄）→ 直接通過
     if user_book in titles:
         return True, user_book, "", False
 
+    # 命中別名（K欄）→ 映射後直接通過
     if user_book in alias2title:
         return True, alias2title[user_book], "", False
 
+    # 兩者都無 → 模糊比對並詢問
     matches = difflib.get_close_matches(user_book, candidates, n=1, cutoff=0.6)
     if matches:
         m = matches[0]
-        canonical = alias2title.get(m, m)
-        msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或「N」取消。"
+        canonical = alias2title.get(m, m)  # 別名→正式
+        msg = f"找不到《{user_book}》。您是要《{canonical}》嗎？\n回覆「Y」採用，或回覆「N」取消。"
         return False, canonical, msg, True
 
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
@@ -141,7 +169,7 @@ def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    # === 如果在暫存狀態 ===
+    # === 若使用者在暫存狀態 ===
     if user_id in PENDING:
         # 新表單 → 視為新案件，清掉舊的
         if text.startswith("#寄書需求") or is_full_form_message(text):
@@ -187,7 +215,7 @@ def handle_message(event):
     # === 一般流程 ===
     data = parse_input(text)
 
-    # 缺漏提示
+    # 欄位缺漏 → 一次提示
     missing = []
     if not data["name"]:    missing.append("學員姓名")
     if not data["phone"]:   missing.append("學員電話")
@@ -206,6 +234,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 缺少欄位：{need}\n\n{demo}"))
         return
 
+    # 基本驗證
     if not validate_phone(data["phone"]):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤（例：0912345678）。"))
         return
@@ -213,6 +242,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址需包含「縣」或「市」，請確認。"))
         return
 
+    # 書名解析
     ok, canonical_book, msg, need_confirm = resolve_book(data["book"])
     if not ok:
         if need_confirm:
@@ -220,6 +250,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
+    # 直接建檔
     zipcode = find_zipcode(data["address"])
     append_row(data["name"], data["phone"], data["address"], zipcode, canonical_book)
     reply = (
