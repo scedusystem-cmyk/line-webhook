@@ -285,9 +285,10 @@ def handle_message(event):
                     f"地址：{data['address']}\n"
                     + (f"備註：{data['note']}\n" if data.get("note") else "")
                     + (f"郵遞區號：{zipcode}\n" if zipcode else "")
-                    f"書籍：{canonical_book}\n"
-                    f"狀態：待處理"
+                    + f"書籍：{canonical_book}\n"
+                    + f"狀態：待處理"
                 )
+
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                 return
 
@@ -355,9 +356,10 @@ def handle_message(event):
         f"地址：{data['address']}\n"
         + (f"備註：{data['note']}\n" if data.get("note") else "")
         + (f"郵遞區號：{zipcode}\n" if zipcode else "")
-        f"書籍：{canonical_book}\n"
-        f"狀態：待處理"
+        + f"書籍：{canonical_book}\n"
+        + f"狀態：待處理"
     )
+
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 # =========================
