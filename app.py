@@ -85,6 +85,38 @@ def get_next_record_id():
     return f"R{next_num:04d}"
 
 # =========================
+# 便利商店寄送：關鍵字偵測
+# =========================
+CONVENIENCE_PATTERNS = [
+    (r"(?:7[\-\s]?11|小七|統一超商)", "7-11"),
+    (r"(?:全家|Family\s*Mart)", "全家"),
+    (r"(?:萊爾富|Hi[\-\s]?Life)", "萊爾富"),
+    (r"(?:OK(?:\s*mart)?|OK便利商店|OK超商)", "OK超商"),
+    (r"(?:超商)", "超商"),  # 泛指
+]
+
+def detect_send_method(text: str) -> str:
+    """從整段文字偵測寄送方式（超商/7-11/全家/萊爾富/OK超商）。有明確『寄送方式：XXX』則優先。"""
+    # 1) 明確欄位優先
+    m = re.search(r"(?:寄送方式)[:：]\s*([^\n]+)", text)
+    if m:
+        s = m.group(1)
+        for pat, label in CONVENIENCE_PATTERNS:
+            if re.search(pat, s, flags=re.IGNORECASE):
+                return label
+        # 欄位有填但非超商：直接回填原字串
+        return s.strip()
+
+    # 2) 自由文字偵測
+    for pat, label in CONVENIENCE_PATTERNS:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return label
+    return ""  # 未偵測到
+
+def is_convenience_method(method: str) -> bool:
+    return method in {"7-11", "全家", "萊爾富", "OK超商", "超商"}
+
+# =========================
 # 解析/驗證
 # =========================
 def is_trigger(text: str) -> bool:
@@ -101,6 +133,7 @@ def parse_input(txt: str):
     - 寄送地址：
     - 書籍名稱：/書籍：/書：
     - 備註：/業務備註：（可選）
+    - 寄送方式：XXX（選填；亦支援自由文字關鍵字自動偵測）
     ＊規則：凡是不符合上述欄位格式的行，將自動歸入「業務備註」。
     """
     lines = txt.splitlines()
@@ -109,6 +142,9 @@ def parse_input(txt: str):
 
     name = phone = address = book = note = ""
     extras = []
+
+    # 先偵測寄送方式（欄位或自由文字）
+    send_method = detect_send_method(txt)
 
     for ln in lines:
         s = ln.strip()
@@ -148,7 +184,14 @@ def parse_input(txt: str):
     elif extras:
         note = (note + "\n" + "\n".join(extras)).strip()
 
-    return {"name": name, "phone": phone, "address": address, "book": book, "note": note}
+    return {
+        "name": name,
+        "phone": phone,
+        "address": address,
+        "book": book,
+        "note": note,
+        "method": send_method,
+    }
 
 def validate_phone(p: str):
     digits = re.sub(r"\D", "", p)  # 清除非數字
@@ -214,8 +257,10 @@ def find_zipcode(address: str):
             return rec.get("郵遞區號", "")
     return ""
 
-def compose_address_with_zip(address: str) -> str:
-    """若地址未以數字ZIP開頭，將 ZIP 前置；找不到ZIP則維持原樣。"""
+def compose_address_with_zip(address: str, method: str) -> str:
+    """若非超商寄送且地址未以ZIP開頭，將ZIP前置；找不到ZIP則維持原樣。"""
+    if is_convenience_method(method):
+        return address  # 超商寄送不前置 ZIP
     zipc = find_zipcode(address)
     if not zipc:
         return address
@@ -226,11 +271,11 @@ def compose_address_with_zip(address: str) -> str:
 # =========================
 # 寫入寄書任務表（A~M）
 # =========================
-def append_row(record_id, sender_name, name, phone, address, book, note):
+def append_row(record_id, sender_name, name, phone, address, book, note, method):
     # 建單日期含時分
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
-    # 郵遞區號前置到地址
-    full_address = compose_address_with_zip(address)
+    # 非超商 → 郵遞區號前置
+    full_address = compose_address_with_zip(address, method)
 
     row = [
         record_id,          # A 紀錄ID
@@ -238,10 +283,10 @@ def append_row(record_id, sender_name, name, phone, address, book, note):
         sender_name,        # C 建單人
         name,               # D 學員姓名
         phone,              # E 學員電話
-        full_address,       # F 寄送地址（已前置ZIP）
+        full_address,       # F 寄送地址（超商則原樣；宅配則前置ZIP）
         book,               # G 書籍名稱
         note,               # H 業務備註
-        "",                 # I 寄送方式
+        method,             # I 寄送方式（偵測到的標準化字串；或空白）
         "",                 # J 寄出日期
         "",                 # K 託運單號
         "",                 # L 經手人
@@ -274,7 +319,7 @@ def handle_message(event):
             TextSendMessage(
                 text=(
                     "請以「#寄書」開頭送單，例如：\n"
-                    "#寄書\n學員姓名：王小明\n學員電話：0912345678\n寄送地址：台中市西屯區至善路250號\n書籍名稱：Let's Go 5\n（可加：備註：XX）"
+                    "#寄書\n學員姓名：王小明\n學員電話：0912345678\n寄送地址：台中市西屯區至善路250號\n書籍名稱：Let's Go 5\n（可加：備註：與 寄送方式：超商/7-11/全家…）"
                 )
             )
         )
@@ -294,24 +339,29 @@ def handle_message(event):
                 if not clean_phone:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤，請重新輸入完整資料。"))
                     return
-                if not validate_address(data["address"]):
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址格式錯誤，請重新輸入包含縣市的地址。"))
+
+                # 若不是超商寄送，才檢查地址必須含縣/市
+                method = data.get("method","")
+                if (not is_convenience_method(method)) and (not validate_address(data["address"])):
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址需包含「縣」或「市」，請確認。"))
                     return
 
                 profile = line_bot_api.get_profile(user_id)
                 sender_name = profile.display_name
                 record_id = get_next_record_id()
 
-                append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
+                append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""), method)
 
-                # 回覆（地址顯示帶ZIP）
-                display_address = compose_address_with_zip(data["address"])
+                # 回覆（地址顯示：超商→原樣；宅配→帶ZIP）
+                display_address = compose_address_with_zip(data["address"], method)
                 lines = [
                     "✅ 已採用建議書名並建檔：",
                     f"姓名：{data['name']}",
                     f"電話：{clean_phone}",
                     f"地址：{display_address}",
                 ]
+                if method:
+                    lines.append(f"寄送方式：{method}")
                 if data.get("note"):
                     lines.append(f"備註：{data['note']}")
                 lines.append(f"書籍：{canonical_book}")
@@ -339,8 +389,10 @@ def handle_message(event):
     missing = []
     if not data["name"]:    missing.append("學員姓名")
     if not data["phone"]:   missing.append("學員電話")
-    if not data["address"]: missing.append("寄送地址")
     if not data["book"]:    missing.append("書籍名稱")
+    # 地址：若非超商寄送才列為必填
+    if not is_convenience_method(data.get("method","")) and not data["address"]:
+        missing.append("寄送地址")
     if missing:
         need = "、".join(missing)
         demo = (
@@ -348,8 +400,9 @@ def handle_message(event):
             "#寄書\n"
             "學員姓名：王小明\n"
             "學員電話：0912345678\n"
-            "寄送地址：台中市西屯區至善路250號\n"
+            "寄送地址：台中市西屯區至善路250號（若為超商可略）\n"
             "書籍名稱：Let's Go 5\n"
+            "寄送方式：7-11（或 全家/萊爾富/OK超商）\n"
             "備註：可留空（選填）"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 缺少欄位：{need}\n\n{demo}"))
@@ -359,7 +412,10 @@ def handle_message(event):
     if not clean_phone:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 電話號碼格式錯誤（例：0912345678）。"))
         return
-    if not validate_address(data["address"]):
+
+    # 若非超商寄送，才檢查地址格式需含縣/市
+    method = data.get("method","")
+    if (not is_convenience_method(method)) and (not validate_address(data["address"])):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址需包含「縣」或「市」，請確認。"))
         return
 
@@ -374,16 +430,18 @@ def handle_message(event):
     sender_name = profile.display_name
     record_id = get_next_record_id()
 
-    append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
+    append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""), method)
 
-    # 回覆（地址顯示帶ZIP）
-    display_address = compose_address_with_zip(data["address"])
+    # 回覆（地址顯示：超商→原樣；宅配→帶ZIP）
+    display_address = compose_address_with_zip(data["address"], method)
     lines = [
         "✅ 已成功建檔：",
         f"姓名：{data['name']}",
         f"電話：{clean_phone}",
         f"地址：{display_address}",
     ]
+    if method:
+        lines.append(f"寄送方式：{method}")
     if data.get("note"):
         lines.append(f"備註：{data['note']}")
     lines.append(f"書籍：{canonical_book}")
