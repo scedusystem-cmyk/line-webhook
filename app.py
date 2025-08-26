@@ -9,6 +9,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
+# === Google Sheets 讀寫開始 ===
 # ===== Google Sheets 連線 =====
 SHEET_ID = os.getenv("SHEET_ID", "")
 
@@ -44,19 +45,47 @@ print("=== DEBUG: Worksheets found ===", _titles)
 MAIN_WS = _spread.worksheet(MAIN_SHEET_NAME)
 ZIP_WS  = _spread.worksheet(ZIP_SHEET_NAME)
 BOOK_WS = _spread.worksheet(BOOK_SHEET_NAME)
+# === Google Sheets 讀寫結束 ===
 
+# === LINE Webhook 開始 ===
 # ===== LINE Bot =====
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# === LINE Webhook 結束 ===
 
-# ===== 暫存狀態 =====
+# === 狀態管理開始 ===
 PENDING = {}
 CONFIRM_OK = {"y","yes","是","好","ok","確認","對","Y","OK","Ok"}
 CONFIRM_NO = {"n","no","否","不要","取消","N","取消作業","重新輸入"}
 
-# ===== 工具函式 =====
+def start_pending(user_id: str, p_type: str, data: dict, context: dict):
+    PENDING[user_id] = {"type": p_type, "data": data, "context": context}
+
+def clear_pending(user_id: str):
+    if user_id in PENDING:
+        del PENDING[user_id]
+# === 狀態管理結束 ===
+
+# === 流水號工具開始 ===
+def get_next_record_id():
+    """回傳新紀錄ID，格式：R0001, R0002...（取A欄目前最大號+1）"""
+    col_values = MAIN_WS.col_values(1)  # 讀取A欄
+    max_num = 0
+    # 跳過表頭（第一列），從第二列開始
+    for v in col_values[1:]:
+        v = (v or "").strip()
+        if v.startswith("R") and v[1:].isdigit():
+            num = int(v[1:])
+            if num > max_num:
+                max_num = num
+    next_num = max_num + 1
+    return f"R{next_num:04d}"
+# === 流水號工具結束 ===
+
+# === 資料驗證開始 ===
+# ===== 工具函式（解析/驗證） =====
 def parse_input(txt: str):
     lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("#")]
     txt = "\n".join(lines)
@@ -88,7 +117,9 @@ def validate_phone(p: str):
 
 def validate_address(a: str):
     return ("縣" in a) or ("市" in a)
+# === 資料驗證結束 ===
 
+# === 書名比對開始 ===
 def load_book_index():
     rows = BOOK_WS.get_all_values()
     titles = set()
@@ -130,14 +161,18 @@ def resolve_book(user_book: str):
         return False, canonical, msg, True
 
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
+# === 書名比對結束 ===
 
+# === 郵遞區號比對開始 ===
 def find_zipcode(address: str):
     records = ZIP_WS.get_all_records()
     for rec in records:
         if rec.get("地區") and rec["地區"] in address:
             return rec.get("郵遞區號", "")
     return ""
+# === 郵遞區號比對結束 ===
 
+# === 寫入寄書任務表開始 ===
 def append_row(record_id, sender_name, name, phone, address, zipcode, book):
     today = datetime.today().strftime("%Y-%m-%d")
     row = [
@@ -148,17 +183,12 @@ def append_row(record_id, sender_name, name, phone, address, zipcode, book):
         phone,        # E 學員電話
         address,      # F 寄送地址
         book,         # G 書籍名稱
-        "", "", "", "", "", "", ""  # H~N 空白
+        "", "", "", "", "", "", ""  # H~N 空白（語別、寄送方式、寄出日期、託運單號、寄送狀態、備註、資料檢核狀態）
     ]
     MAIN_WS.append_row(row)
+# === 寫入寄書任務表結束 ===
 
-def start_pending(user_id: str, p_type: str, data: dict, context: dict):
-    PENDING[user_id] = {"type": p_type, "data": data, "context": context}
-
-def clear_pending(user_id: str):
-    if user_id in PENDING:
-        del PENDING[user_id]
-
+# === LINE Webhook 事件處理開始 ===
 # ===== Webhook =====
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -194,7 +224,7 @@ def handle_message(event):
 
                 profile = line_bot_api.get_profile(user_id)
                 sender_name = profile.display_name
-                record_id = len(MAIN_WS.get_all_values())
+                record_id = get_next_record_id()
 
                 zipcode = find_zipcode(data["address"])
                 append_row(record_id, sender_name, data["name"], clean_phone, data["address"], zipcode, canonical_book)
@@ -257,7 +287,7 @@ def handle_message(event):
 
     profile = line_bot_api.get_profile(user_id)
     sender_name = profile.display_name
-    record_id = len(MAIN_WS.get_all_values())
+    record_id = get_next_record_id()
 
     zipcode = find_zipcode(data["address"])
     append_row(record_id, sender_name, data["name"], clean_phone, data["address"], zipcode, canonical_book)
@@ -270,6 +300,9 @@ def handle_message(event):
         f"書籍：{canonical_book}"
     )
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+# === LINE Webhook 事件處理結束 ===
 
+# === 應用程式啟動開始 ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+# === 應用程式啟動結束 ===
