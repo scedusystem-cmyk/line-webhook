@@ -11,7 +11,6 @@ app = Flask(__name__)
 
 # =========================
 # Google Sheets 連線設定區
-# （錨點：需改的分頁名/Sheet ID/金鑰請看環境變數）
 # =========================
 SHEET_ID = os.getenv("SHEET_ID", "")
 
@@ -27,15 +26,14 @@ def _build_gspread_client():
         return gspread.authorize(creds)
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     if not sa_json:
-        raise RuntimeError("Missing service account credentials. "
-                           "Provide service_account.json file OR set env GOOGLE_SERVICE_ACCOUNT_JSON.")
+        raise RuntimeError("Missing service account credentials. Provide service_account.json OR env GOOGLE_SERVICE_ACCOUNT_JSON.")
     info = json.loads(sa_json)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 GC = _build_gspread_client()
 
-# （錨點：分頁名稱若改，直接改環境變數或這裡的預設值）
+# （可用環境變數覆蓋）
 MAIN_SHEET_NAME = os.getenv("MAIN_SHEET_NAME", "寄書任務")
 ZIP_SHEET_NAME  = os.getenv("ZIP_SHEET_NAME", "郵遞區號參照表")
 BOOK_SHEET_NAME = os.getenv("BOOK_SHEET_NAME", "書目主檔")
@@ -103,31 +101,59 @@ def parse_input(txt: str):
     - 寄送地址：
     - 書籍名稱：/書籍：/書：
     - 備註：/業務備註：（可選）
+    ＊新增規則：凡是不符合上述欄位格式的行，將自動歸入「業務備註」。
     """
     lines = txt.splitlines()
     if lines and lines[0].strip().startswith("#寄書"):
-        lines = lines[1:]  # 去掉觸發行
-    # 保留使用者內容（不要砍掉 #），避免誤刪內文
-    txt = "\n".join(lines)
+        lines = lines[1:]
 
-    name_pat    = r"(?:學員)?姓名[:：]?\s*([^\n]+)"
-    phone_pat   = r"(?:學員)?電話[:：]?\s*([0-9\-\s\(\)]+)"
-    address_pat = r"(?:寄送)?地址[:：]?\s*([^\n]+)"
-    book_pat    = r"(?:書籍名稱|書籍|書)[:：]?\s*([^\n]+)"
-    note_pat    = r"(?:備註|業務備註)[:：]?\s*([^\n]+)"
+    name = phone = address = book = note = ""
+    extras = []
 
-    name = re.search(name_pat, txt)
-    phone = re.search(phone_pat, txt)
-    addr = re.search(address_pat, txt)
-    book = re.search(book_pat, txt)
-    note = re.search(note_pat, txt)
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+
+        m = re.match(r"^(?:學員)?姓名[:：]\s*(.+)$", s)
+        if m:
+            name = m.group(1).strip()
+            continue
+
+        m = re.match(r"^(?:學員)?電話[:：]\s*([0-9\-\s\(\)]+)$", s)
+        if m:
+            phone = m.group(1).strip()
+            continue
+
+        m = re.match(r"^(?:寄送)?地址[:：]\s*(.+)$", s)
+        if m:
+            address = m.group(1).strip()
+            continue
+
+        m = re.match(r"^(?:書籍名稱|書籍|書)[:：]\s*(.+)$", s)
+        if m:
+            book = m.group(1).strip()
+            continue
+
+        m = re.match(r"^(?:備註|業務備註)[:：]\s*(.+)$", s)
+        if m:
+            note = (note + "\n" + m.group(1).strip()).strip() if note else m.group(1).strip()
+            continue
+
+        # 其他未匹配行 → 歸入備註
+        extras.append(s)
+
+    if extras and not note:
+        note = "\n".join(extras)
+    elif extras:
+        note = (note + "\n" + "\n".join(extras)).strip()
 
     return {
-        "name": name.group(1).strip() if name else "",
-        "phone": phone.group(1).strip() if phone else "",
-        "address": addr.group(1).strip() if addr else "",
-        "book": book.group(1).strip() if book else "",
-        "note": note.group(1).strip() if note else ""
+        "name": name,
+        "phone": phone,
+        "address": address,
+        "book": book,
+        "note": note
     }
 
 def is_full_form_message(txt: str) -> bool:
@@ -190,7 +216,7 @@ def resolve_book(user_book: str):
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
 
 # =========================
-# 郵遞區號（僅用於回覆展示；目前不入表）
+# 郵遞區號（用於回覆展示）
 # =========================
 def find_zipcode(address: str):
     records = ZIP_WS.get_all_records()
@@ -200,8 +226,7 @@ def find_zipcode(address: str):
     return ""
 
 # =========================
-# 寫入寄書任務表
-# （錨點：這裡對應新的 A~M 欄位）
+# 寫入寄書任務表（A~M）
 # =========================
 def append_row(record_id, sender_name, name, phone, address, book, note):
     # 建單日期含時分
@@ -214,11 +239,11 @@ def append_row(record_id, sender_name, name, phone, address, book, note):
         phone,              # E 學員電話
         address,            # F 寄送地址
         book,               # G 書籍名稱
-        note,               # H 業務備註（可空字串）
-        "",                 # I 寄送方式（保留空白）
-        "",                 # J 寄出日期（保留空白）
-        "",                 # K 託運單號（保留空白）
-        "",                 # L 經手人（保留空白）
+        note,               # H 業務備註（可空）
+        "",                 # I 寄送方式
+        "",                 # J 寄出日期
+        "",                 # K 託運單號
+        "",                 # L 經手人
         "待處理",           # M 寄送狀態（預設）
     ]
     MAIN_WS.append_row(row)
@@ -242,23 +267,25 @@ def handle_message(event):
     text = event.message.text.strip()
 
     # ===== 僅允許 #寄書 作為新單觸發 =====
-    # 若使用者在「模糊比對待確認」階段，仍可回覆 Y/N 繼續，不需要再 #寄書
     if user_id not in PENDING and not is_trigger(text):
-        # 非觸發訊息，不處理（也可改為友善提示）
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="請以「#寄書」開頭送單，例如：\n#寄書\n學員姓名：王小明\n學員電話：0912345678\n寄送地址：台中市西屯區至善路250號\n書籍名稱：Let's Go 5\n（可加：備註：XX）")
+            TextSendMessage(
+                text=(
+                    "請以「#寄書」開頭送單，例如：\n"
+                    "#寄書\n學員姓名：王小明\n學員電話：0912345678\n寄送地址：台中市西屯區至善路250號\n書籍名稱：Let's Go 5\n（可加：備註：XX）"
+                )
+            )
         )
         return
 
-    # ===== 已在等待 Y/N 的階段 =====
+    # ===== 等待 Y/N 階段 =====
     if user_id in PENDING:
-        # 若改貼 #寄書 重新送單，就清除等待狀態，走新單流程
         if is_trigger(text):
-            clear_pending(user_id)
+            clear_pending(user_id)  # 使用者改貼新單，清除等待狀態
         else:
-            if text in CONFIRM_OK and PENDING[user_id]["type"] == "confirm_suggestion":
-                info = PENDING.pop(user_id)
+            info = PENDING[user_id]
+            if text in CONFIRM_OK and info["type"] == "confirm_suggestion":
                 data = info["data"]
                 canonical_book = info["context"]["suggested_book"]
 
@@ -274,21 +301,24 @@ def handle_message(event):
                 sender_name = profile.display_name
                 record_id = get_next_record_id()
 
-                # 入表（新版欄位＋備註）
                 append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
 
                 zipcode = find_zipcode(data["address"])
-                reply = (
-                    "✅ 已採用建議書名並建檔：\n"
-                    f"姓名：{data['name']}\n"
-                    f"電話：{clean_phone}\n"
-                    f"地址：{data['address']}\n"
-                    + (f"備註：{data['note']}\n" if data.get("note") else "")
-                    + (f"郵遞區號：{zipcode}\n" if zipcode else "")
-                    + f"書籍：{canonical_book}\n"
-                    + f"狀態：待處理"
-                )
+                lines = [
+                    "✅ 已採用建議書名並建檔：",
+                    f"姓名：{data['name']}",
+                    f"電話：{clean_phone}",
+                    f"地址：{data['address']}",
+                ]
+                if data.get("note"):
+                    lines.append(f"備註：{data['note']}")
+                if zipcode:
+                    lines.append(f"郵遞區號：{zipcode}")
+                lines.append(f"書籍：{canonical_book}")
+                lines.append("狀態：待處理")
+                reply = "\n".join(lines)
 
+                clear_pending(user_id)
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
                 return
 
@@ -304,8 +334,8 @@ def handle_message(event):
             return
 
     # ===== 新單流程（#寄書） =====
-    # 檢查欄位
     data = parse_input(text)
+
     missing = []
     if not data["name"]:    missing.append("學員姓名")
     if not data["phone"]:   missing.append("學員電話")
@@ -333,7 +363,6 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 地址需包含「縣」或「市」，請確認。"))
         return
 
-    # 書名比對 / 模糊建議
     ok, canonical_book, msg, need_confirm = resolve_book(data["book"])
     if not ok:
         if need_confirm:
@@ -341,7 +370,6 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
-    # 建檔
     profile = line_bot_api.get_profile(user_id)
     sender_name = profile.display_name
     record_id = get_next_record_id()
@@ -349,16 +377,19 @@ def handle_message(event):
     append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
 
     zipcode = find_zipcode(data["address"])
-    reply = (
-        "✅ 已成功建檔：\n"
-        f"姓名：{data['name']}\n"
-        f"電話：{clean_phone}\n"
-        f"地址：{data['address']}\n"
-        + (f"備註：{data['note']}\n" if data.get("note") else "")
-        + (f"郵遞區號：{zipcode}\n" if zipcode else "")
-        + f"書籍：{canonical_book}\n"
-        + f"狀態：待處理"
-    )
+    lines = [
+        "✅ 已成功建檔：",
+        f"姓名：{data['name']}",
+        f"電話：{clean_phone}",
+        f"地址：{data['address']}",
+    ]
+    if data.get("note"):
+        lines.append(f"備註：{data['note']}")
+    if zipcode:
+        lines.append(f"郵遞區號：{zipcode}")
+    lines.append(f"書籍：{canonical_book}")
+    lines.append("狀態：待處理")
+    reply = "\n".join(lines)
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
@@ -366,5 +397,4 @@ def handle_message(event):
 # App 啟動
 # =========================
 if __name__ == "__main__":
-    # Railway 預設 PORT
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
