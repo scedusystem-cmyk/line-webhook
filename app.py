@@ -101,7 +101,7 @@ def parse_input(txt: str):
     - 寄送地址：
     - 書籍名稱：/書籍：/書：
     - 備註：/業務備註：（可選）
-    ＊新增規則：凡是不符合上述欄位格式的行，將自動歸入「業務備註」。
+    ＊規則：凡是不符合上述欄位格式的行，將自動歸入「業務備註」。
     """
     lines = txt.splitlines()
     if lines and lines[0].strip().startswith("#寄書"):
@@ -148,20 +148,7 @@ def parse_input(txt: str):
     elif extras:
         note = (note + "\n" + "\n".join(extras)).strip()
 
-    return {
-        "name": name,
-        "phone": phone,
-        "address": address,
-        "book": book,
-        "note": note
-    }
-
-def is_full_form_message(txt: str) -> bool:
-    """必須同時：#寄書 觸發 + 四大欄位齊全"""
-    if not is_trigger(txt):
-        return False
-    data = parse_input(txt)
-    return all([data["name"], data["phone"], data["address"], data["book"]])
+    return {"name": name, "phone": phone, "address": address, "book": book, "note": note}
 
 def validate_phone(p: str):
     digits = re.sub(r"\D", "", p)  # 清除非數字
@@ -216,14 +203,25 @@ def resolve_book(user_book: str):
     return False, "", f"⚠️ 書籍《{user_book}》不存在，請確認後再輸入。", False
 
 # =========================
-# 郵遞區號（用於回覆展示）
+# 郵遞區號 & 地址組裝
 # =========================
 def find_zipcode(address: str):
+    """依 〈郵遞區號參照表〉的『地區』欄進行包含比對，回傳郵遞區號或空字串。"""
     records = ZIP_WS.get_all_records()
     for rec in records:
-        if rec.get("地區") and rec["地區"] in address:
+        area = rec.get("地區")
+        if area and area in address:
             return rec.get("郵遞區號", "")
     return ""
+
+def compose_address_with_zip(address: str) -> str:
+    """若地址未以數字ZIP開頭，將 ZIP 前置；找不到ZIP則維持原樣。"""
+    zipc = find_zipcode(address)
+    if not zipc:
+        return address
+    if re.match(r"^\s*\d{3,5}", address):  # 已存在郵遞區號
+        return address
+    return f"{zipc}{address}"
 
 # =========================
 # 寫入寄書任務表（A~M）
@@ -231,15 +229,18 @@ def find_zipcode(address: str):
 def append_row(record_id, sender_name, name, phone, address, book, note):
     # 建單日期含時分
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 郵遞區號前置到地址
+    full_address = compose_address_with_zip(address)
+
     row = [
         record_id,          # A 紀錄ID
         today,              # B 建單日期（YYYY-MM-DD HH:MM）
         sender_name,        # C 建單人
         name,               # D 學員姓名
         phone,              # E 學員電話
-        address,            # F 寄送地址
+        full_address,       # F 寄送地址（已前置ZIP）
         book,               # G 書籍名稱
-        note,               # H 業務備註（可空）
+        note,               # H 業務備註
         "",                 # I 寄送方式
         "",                 # J 寄出日期
         "",                 # K 託運單號
@@ -303,17 +304,16 @@ def handle_message(event):
 
                 append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
 
-                zipcode = find_zipcode(data["address"])
+                # 回覆（地址顯示帶ZIP）
+                display_address = compose_address_with_zip(data["address"])
                 lines = [
                     "✅ 已採用建議書名並建檔：",
                     f"姓名：{data['name']}",
                     f"電話：{clean_phone}",
-                    f"地址：{data['address']}",
+                    f"地址：{display_address}",
                 ]
                 if data.get("note"):
                     lines.append(f"備註：{data['note']}")
-                if zipcode:
-                    lines.append(f"郵遞區號：{zipcode}")
                 lines.append(f"書籍：{canonical_book}")
                 lines.append("狀態：待處理")
                 reply = "\n".join(lines)
@@ -376,17 +376,16 @@ def handle_message(event):
 
     append_row(record_id, sender_name, data["name"], clean_phone, data["address"], canonical_book, data.get("note",""))
 
-    zipcode = find_zipcode(data["address"])
+    # 回覆（地址顯示帶ZIP）
+    display_address = compose_address_with_zip(data["address"])
     lines = [
         "✅ 已成功建檔：",
         f"姓名：{data['name']}",
         f"電話：{clean_phone}",
-        f"地址：{data['address']}",
+        f"地址：{display_address}",
     ]
     if data.get("note"):
         lines.append(f"備註：{data['note']}")
-    if zipcode:
-        lines.append(f"郵遞區號：{zipcode}")
     lines.append(f"書籍：{canonical_book}")
     lines.append("狀態：待處理")
     reply = "\n".join(lines)
