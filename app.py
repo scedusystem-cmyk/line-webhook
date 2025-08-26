@@ -7,6 +7,17 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
+# ====== （OCR 新增）import 區 ======
+import io
+from linebot.models import ImageMessage  # 圖片訊息 handler 用
+try:
+    from google.cloud import vision
+    from google.oauth2 import service_account
+    _HAS_VISION = True
+except Exception:
+    _HAS_VISION = False
+# ==================================
+
 app = Flask(__name__)
 
 # =========================
@@ -295,6 +306,56 @@ def append_row(record_id, sender_name, name, phone, address, book, note, method)
     MAIN_WS.append_row(row)
 
 # =========================
+# （OCR 新增）初始化：Vision Client & 開關
+# =========================
+OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
+
+def _build_vision_client():
+    if not _HAS_VISION:
+        return None
+    try:
+        # 優先讀取本地 service_account.json，否則讀環境變數 JSON
+        if os.path.exists("service_account.json"):
+            creds = service_account.Credentials.from_service_account_file("service_account.json")
+        else:
+            sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+            if not sa_json:
+                return None
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info)
+        return vision.ImageAnnotatorClient(credentials=creds)
+    except Exception as e:
+        app.logger.error(f"[OCR] 建立 Vision Client 失敗：{e}")
+        return None
+
+VISION_CLIENT = _build_vision_client()
+
+def _download_line_image_bytes(message_id: str) -> bytes:
+    """從 LINE 把圖片抓下來（bytes）"""
+    content = line_bot_api.get_message_content(message_id)
+    buf = io.BytesIO()
+    for chunk in content.iter_content():
+        buf.write(chunk)
+    return buf.getvalue()
+
+def _ocr_text_from_bytes(img_bytes: bytes) -> str:
+    """呼叫 Google Vision OCR → 回傳全文字（可含換行）。若關閉或未安裝，回空字串"""
+    if not (OCR_ENABLED and VISION_CLIENT):
+        return ""
+    try:
+        image = vision.Image(content=img_bytes)
+        resp = VISION_CLIENT.document_text_detection(image=image)
+        if resp.error.message:
+            app.logger.error(f"[OCR] Vision error: {resp.error.message}")
+            return ""
+        if resp.full_text_annotation and resp.full_text_annotation.text:
+            return resp.full_text_annotation.text.strip()
+        return ""
+    except Exception as e:
+        app.logger.error(f"[OCR] OCR 執行失敗：{e}")
+        return ""
+
+# =========================
 # LINE Webhook
 # =========================
 @app.route("/callback", methods=["POST"])
@@ -449,6 +510,45 @@ def handle_message(event):
     reply = "\n".join(lines)
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+# =========================
+# （OCR 新增）圖片訊息處理器：不動寄書流程，只做 OCR 回覆
+# =========================
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    try:
+        user_id = getattr(event.source, "user_id", "unknown")
+        app.logger.info(f"[IMG] 收到圖片 user_id={user_id}, msg_id={event.message.id}")
+
+        # 下載圖片
+        img_bytes = _download_line_image_bytes(event.message.id)
+
+        # 做 OCR
+        text = _ocr_text_from_bytes(img_bytes)
+
+        # 回覆 & Log
+        if text:
+            preview = (text[:200] + "…") if len(text) > 200 else text
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"✅ 已收到圖片並完成 OCR：\n{preview}")
+            )
+            app.logger.info(f"[OCR_TEXT]\n{text}")
+        else:
+            tip = "（目前 OCR 未啟用或未安裝 Vision 套件）" if not (OCR_ENABLED and VISION_CLIENT) else "（圖片內容可能不清楚，請換一張試試）"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"我收到你的照片囉，但沒有辨識到文字 {tip}")
+            )
+    except Exception as e:
+        app.logger.exception(f"[IMG] 解析圖片失敗：{e}")
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="抱歉，圖片解析發生錯誤，我已記錄 Log。")
+            )
+        except Exception:
+            pass
 
 # =========================
 # App 啟動
