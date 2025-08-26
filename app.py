@@ -512,7 +512,7 @@ def handle_message(event):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 # =========================
-# 圖片訊息處理器（測試版）
+# 圖片訊息處理器（含 OCR debug）
 # =========================
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
@@ -520,14 +520,39 @@ def handle_image_message(event):
         user_id = getattr(event.source, "user_id", "unknown")
         app.logger.info(f"[IMG] 收到圖片 user_id={user_id}, msg_id={event.message.id}")
 
-        # 先不用 OCR，單純回覆測試
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="✅ 收到圖片囉！")
-        )
+        # 下載圖片
+        img_bytes = _download_line_image_bytes(event.message.id)
+
+        # 做 OCR
+        text = _ocr_text_from_bytes(img_bytes)
+
+        # ⚡️ 新增 Debug Log
+        app.logger.info(f"[OCR_RAW_OUTPUT] {repr(text)}")
+
+        # 回覆 & Log
+        if text:
+            preview = (text[:200] + "…") if len(text) > 200 else text
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"✅ 已收到圖片並完成 OCR：\n{preview}")
+            )
+            app.logger.info(f"[OCR_TEXT]\n{text}")
+        else:
+            tip = "（目前 OCR 未啟用或未安裝 Vision 套件）" if not (OCR_ENABLED and VISION_CLIENT) else "（圖片內容可能不清楚，請換一張試試）"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"我收到你的照片囉，但沒有辨識到文字 {tip}")
+            )
 
     except Exception as e:
-        app.logger.exception(f"[IMG] 測試錯誤：{e}")
+        app.logger.exception(f"[IMG] 解析圖片失敗：{e}")
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="抱歉，圖片解析發生錯誤，我已記錄 Log。")
+            )
+        except Exception:
+            pass
 
 # =========================
 # App 啟動
