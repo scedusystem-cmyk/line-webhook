@@ -409,4 +409,4 @@ def handle_message(event):
 def handle_image_message(event):
     try:
         user_id = getattr(event.source, "user_id", "unknown")
-        app.logger.info(f"[IMG] 收到圖片 user_id={user_id}, msg_id={event.message
+        app.logger.info(f"[IMG] 收到圖片 user_id={user_id}, msg_id={event.message.id}")
