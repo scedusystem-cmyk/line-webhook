@@ -238,7 +238,7 @@ def update_sheet_with_pairs(pairs, handler_display_name: str):
     僅寫入 tracking12 長度=12 的資料（呼叫端已驗算）。
     """
     if not pairs:
-        return {"updated": 0, "not_found": [], "details": []}
+        return {"updated": 0, "not_found": [], "details": [], "skipped": []}
 
     gc = _build_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
@@ -250,7 +250,7 @@ def update_sheet_with_pairs(pairs, handler_display_name: str):
     COL_SHIP_DATE = "寄出日期"
     COL_TRACKING  = "託運單號"
     COL_STATUS    = "寄送狀態"
-    COL_HANDLER   = "經手人"   # 建議新增此欄；若不存在則落到備註
+    COL_HANDLER   = "經手人"
     COL_NOTE      = "備註"
     # ============================================================
 
@@ -276,11 +276,17 @@ def update_sheet_with_pairs(pairs, handler_display_name: str):
     col_handler   = header_idx.get(COL_HANDLER)
     col_note      = header_idx.get(COL_NOTE)
 
+    # 小工具：把 A1 座標補上工作表名稱，避免寫到別的分頁
+    def rng(a1: str) -> str:
+        # 工作表名若有空白或特殊字元，加單引號
+        return f"'{MAIN_SHEET_NAME}'!{a1}"
+
     today = datetime.now().strftime("%Y-%m-%d")
 
     updated = 0
     not_found = []
     details = []
+    skipped = []
     batch_data = []
 
     for rid, tracking12 in pairs:
@@ -289,37 +295,55 @@ def update_sheet_with_pairs(pairs, handler_display_name: str):
             not_found.append(rid)
             continue
 
-        # 這裡只會收到長度=12 的 tracking12
+        row_writes = 0
         if col_tracking:
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_tracking), "values": [[tracking12]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_tracking)
+            batch_data.append({"range": rng(a1), "values": [[tracking12]]})
+            row_writes += 1
         if col_ship_mtd:
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_ship_mtd), "values": [["便利帶"]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_ship_mtd)
+            batch_data.append({"range": rng(a1), "values": [["便利帶"]]})
+            row_writes += 1
         if col_ship_date:
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_ship_date), "values": [[today]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_ship_date)
+            batch_data.append({"range": rng(a1), "values": [[today]]})
+            row_writes += 1
         if col_status:
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_status), "values": [["已託運"]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_status)
+            batch_data.append({"range": rng(a1), "values": [["已託運"]]})
+            row_writes += 1
 
         # 經手人欄位：若沒有就附加到備註
         if col_handler:
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_handler), "values": [[handler_display_name]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_handler)
+            batch_data.append({"range": rng(a1), "values": [[handler_display_name]]})
+            row_writes += 1
         elif col_note:
             old_note = ws.cell(row, col_note).value or ""
             sep = "；" if old_note and not old_note.endswith(("；", ";")) else ""
             new_note = f"{old_note}{sep}經手人：{handler_display_name}".strip("；")
-            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_note), "values": [[new_note]]})
+            a1 = gspread.utils.rowcol_to_a1(row, col_note)
+            batch_data.append({"range": rng(a1), "values": [[new_note]]})
+            row_writes += 1
 
-        updated += 1
-        details.append(f"{rid} → {tracking12}")
+        if row_writes > 0:
+            updated += 1
+            details.append(f"{rid} → {tracking12}")
+        else:
+            skipped.append(rid)  # 沒有任何可寫欄位
 
-    # 批次寫入
+    # 批次寫入（這次都有帶上分頁名稱）
     if batch_data:
         body = {
             "valueInputOption": "USER_ENTERED",
             "data": [{"range": it["range"], "values": it["values"]} for it in batch_data]
         }
+        # 多補一行 log，方便你在 Railway Logs 檢查發送範圍
+        app.logger.info(f"[GSHEET_BATCH_UPDATE] {len(batch_data)} ranges")
         ws.spreadsheet.values_batch_update(body)
 
-    return {"updated": updated, "not_found": not_found, "details": details}
+    return {"updated": updated, "not_found": not_found, "details": details, "skipped": skipped}
+
 
 # =========================
 # ✅ 圖片訊息處理：拍照 → OCR → 解析 → 驗算 → 寫回
