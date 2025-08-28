@@ -303,7 +303,9 @@ def append_row(record_id, sender_name, name, phone, address, book, note, method)
         "",                 # L 經手人
         "待處理",           # M 寄送狀態（預設）
     ]
-    MAIN_WS.append_row(row)
+    # ⚡️ 修改：改成插入第2列（表頭下面一列），最新在最上方
+    MAIN_WS.insert_row(row, 2)
+
 
 # =========================
 # （OCR 新增）初始化：Vision Client & 開關
