@@ -143,7 +143,7 @@ def search_ship_status(query: str) -> str:
             if not build_date_str:
                 continue
             try:
-                # ⚡ 修正：只取日期前 10 碼 (YYYY-MM-DD)，忽略時間
+                # ⚡ 只取日期前 10 碼，避免時間格式報錯
                 date_part = build_date_str[:10]
                 build_date = datetime.strptime(date_part, "%Y-%m-%d").date()
             except Exception:
@@ -152,8 +152,13 @@ def search_ship_status(query: str) -> str:
                 continue
 
             name = str(row.get("學員姓名", "")).strip()
-            phone = str(row.get("學員電話", "")).strip()
-            if query in name or query in phone:
+            phone_raw = str(row.get("學員電話", "")).strip()
+
+            # ⚡ 電話只取後 9 碼比對
+            phone_tail9 = phone_raw[-9:] if len(phone_raw) >= 9 else phone_raw
+            query_tail9 = query[-9:] if query.isdigit() else query
+
+            if query in name or query_tail9 == phone_tail9:
                 matched.append(row)
 
         if not matched:
@@ -189,6 +194,7 @@ def search_ship_status(query: str) -> str:
     except Exception as e:
         app.logger.exception(e)
         return f"❌ 查詢時發生錯誤：{e}"
+
 
 # =========================
 # 工具：下載 LINE 圖片位元組
