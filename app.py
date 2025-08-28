@@ -143,7 +143,9 @@ def search_ship_status(query: str) -> str:
             if not build_date_str:
                 continue
             try:
-                build_date = datetime.strptime(build_date_str, "%Y-%m-%d").date()
+                # ⚡ 修正：只取日期前 10 碼 (YYYY-MM-DD)，忽略時間
+                date_part = build_date_str[:10]
+                build_date = datetime.strptime(date_part, "%Y-%m-%d").date()
             except Exception:
                 continue
             if build_date < cutoff:
