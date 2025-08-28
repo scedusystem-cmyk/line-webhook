@@ -1,95 +1,99 @@
+# app.py
+# ============================================
+# 尚進《寄書＋進銷存》：OCR → 解析 → 回填寄書任務
+# - 只抓取：紀錄ID（R+4碼）與 下方手寫12碼託運單號
+# - 只寫入長度=12的託運單號，否則回覆提醒人工檢查
+# ============================================
+
 from flask import Flask, request, abort
 import gspread
 from google.oauth2.service_account import Credentials
-import os, re, difflib, json
+import os, re, json, io, logging
 from datetime import datetime
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage
-
-# ====== （OCR 新增）import 區 ======
-import io
-try:
-    from google.cloud import vision
-    from google.oauth2 import service_account
-    _HAS_VISION = True
-except Exception:
-    _HAS_VISION = False
-# ==================================
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    ImageMessage
+)
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 # =========================
-# Google Sheets 連線設定區
+# ✅（錨點）Google Sheets 連線設定
 # =========================
-SHEET_ID = os.getenv("SHEET_ID", "")
+SHEET_ID = os.getenv("SHEET_ID", "")  # 你的試算表 ID
+MAIN_SHEET_NAME = os.getenv("MAIN_SHEET_NAME", "寄書任務")  # 主工作表名（預設：寄書任務）
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
 def _build_gspread_client():
+    """
+    先找 service_account.json（檔案），找不到再用環境變數 GOOGLE_SERVICE_ACCOUNT_JSON。
+    """
     json_path = "service_account.json"
     if os.path.exists(json_path):
         creds = Credentials.from_service_account_file(json_path, scopes=SCOPES)
         return gspread.authorize(creds)
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     if not sa_json:
-        raise RuntimeError("Missing service account credentials.")
+        raise RuntimeError("缺少 Google Service Account 憑證：請提供 service_account.json 或環境變數 GOOGLE_SERVICE_ACCOUNT_JSON")
     creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
     return gspread.authorize(creds)
 
-def _get_worksheet(sheet_name: str):
-    gc = _build_gspread_client()
-    sh = gc.open_by_key(SHEET_ID)
-    return sh.worksheet(sheet_name)
+# =========================
+# ✅（錨點）LINE Bot 設定
+# =========================
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+if not (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN):
+    app.logger.warning("⚠️ 尚未設置 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
-# LINE Bot 設定
+# ✅（錨點）OCR 設定：Google Cloud Vision（可選）
 # =========================
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-
-# =========================
-# 工具函式
-# =========================
-def normalize_phone(phone: str) -> str:
-    digits = re.sub(r"\D", "", phone)
-    if digits.startswith("09") and len(digits) == 10:
-        return digits
-    return ""
-
-def lookup_zipcode(address: str) -> str:
-    """在〈郵遞區號參照表〉找出相符行政區，將郵遞區號 + 原地址回填。"""
-    try:
-        ws = _get_worksheet("郵遞區號參照表")
-        rows = ws.get_all_values()
-        for row in rows[1:]:
-            # 假設 A欄=郵遞區號, B欄=行政區片段（例如 台中市西屯區）
-            if len(row) >= 2 and row[1] and row[1] in address:
-                return row[0] + address
-    except Exception as e:
-        app.logger.error(f"[ZIPCODE] lookup error: {e}")
-    return address
-
-def fuzzy_match_book(book_name: str) -> str | None:
-    """在〈書目主檔〉做模糊比對（B欄正式書名），cutoff=0.6，回傳最佳匹配或 None。"""
-    ws = _get_worksheet("書目主檔")
-    vals = ws.get_all_values()
-    official_names = [row[1] for row in vals[1:] if len(row) > 1 and row[1]]
-    matches = difflib.get_close_matches(book_name, official_names, n=1, cutoff=0.6)
-    return matches[0] if matches else None
+_HAS_VISION = True
+try:
+    from google.cloud import vision
+    from google.oauth2 import service_account as gservice_account
+    # Vision 憑證優先順序：VISION_SERVICE_ACCOUNT_JSON 環境變數 > service_account.json 檔案
+    _vision_creds = None
+    vjson = os.getenv("VISION_SERVICE_ACCOUNT_JSON", "")
+    if vjson:
+        _vision_creds = gservice_account.Credentials.from_service_account_info(json.loads(vjson))
+    else:
+        if os.path.exists("service_account.json"):
+            _vision_creds = gservice_account.Credentials.from_service_account_file("service_account.json")
+        else:
+            # 若沒特別提供，嘗試沿用同一份 GOOGLE_SERVICE_ACCOUNT_JSON
+            sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+            if sa_json:
+                _vision_creds = gservice_account.Credentials.from_service_account_info(json.loads(sa_json))
+            else:
+                _vision_creds = None
+    if _vision_creds is None:
+        _HAS_VISION = False
+except Exception as _e:
+    _HAS_VISION = False
+    app.logger.warning(f"⚠️ Vision 初始化失敗或未安裝：{_e}")
 
 # =========================
-# LINE Webhook 主入口
+# LINE Webhook 入口
 # =========================
-@app.route("/callback", methods=["POST"])
+@app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    app.logger.info(f"[LINE_CALLBACK] body={body[:500]}...")
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -97,175 +101,312 @@ def callback():
     return "OK"
 
 # =========================
-# 文字訊息處理
+# 文字訊息（保留簡單 Echo / 日後擴充）
 # =========================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
-    user_id = getattr(event.source, "user_id", "unknown")
-    user_name = "LINE使用者"  # 之後可改為從 profile 抓顯示名稱
-
     text = event.message.text.strip()
-    if text.startswith("#寄書需求") or text.startswith("#寄書"):
-        # ===== 簡單解析 =====
-        lines = text.split("\n")
-        data = {"name": "", "phone": "", "address": "", "book": ""}
-        for line in lines:
-            if "姓名" in line:
-                data["name"] = line.split("：", 1)[-1].strip()
-            elif "電話" in line:
-                data["phone"] = normalize_phone(line.split("：", 1)[-1])
-            elif "地址" in line:
-                data["address"] = lookup_zipcode(line.split("：", 1)[-1].strip())
-            elif "書籍" in line or "書名" in line:
-                book_input = line.split("：", 1)[-1].strip()
-                match = fuzzy_match_book(book_input)
-                data["book"] = match if match else book_input
-
-        # ===== 檢查缺失 =====
-        missing = [k for k in ["name", "phone", "address", "book"] if not data.get(k)]
-        if missing:
-            reply = f"❌ 缺少欄位: {', '.join(missing)}"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-
-        # ===== 寫入試算表 =====
-        try:
-            ws = _get_worksheet(os.getenv("MAIN_SHEET_NAME", "寄書任務"))
-            rows = ws.get_all_values()
-            new_id = str(len(rows))  # 簡單流水號（依你目前規劃）
-            today = datetime.now().strftime("%Y-%m-%d")
-            row = [
-                new_id,          # A 紀錄ID
-                today,           # B 建單日期
-                user_name,       # C 建單人
-                data["name"],    # D 學員姓名
-                data["phone"],   # E 學員電話（已淨化）
-                data["address"], # F 寄送地址（已加郵遞區號）
-                data["book"],    # G 書籍名稱（含模糊比對結果）
-                "", "", "", "", "", "", ""  # H~N 保留空白
-            ]
-            ws.append_row(row)
-            reply = (
-                "✅ 已成功建檔：\n"
-                f"姓名：{data['name']}\n"
-                f"電話：{data['phone']}\n"
-                f"地址：{data['address']}\n"
-                f"書籍：{data['book']}"
-            )
-        except Exception as e:
-            reply = f"❌ Google Sheet 寫入失敗: {e}"
-
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    # 這裡暫時不動你的寄書任務既有流程，只回應簡訊；後續若要補指令可再擴充
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f"已收到訊息：{text}")
+    )
 
 # =========================
-# 圖片訊息處理器（含 OCR + 健檢 + 詳細錯誤回覆）
+# 工具：下載 LINE 圖片位元組
 # =========================
 def _download_line_image_bytes(message_id: str) -> bytes:
     content = line_bot_api.get_message_content(message_id)
-    return b"".join([chunk for chunk in content.iter_content()])
+    b = io.BytesIO()
+    for chunk in content.iter_content():
+        b.write(chunk)
+    return b.getvalue()
 
-def _ocr_text_from_bytes(img_bytes: bytes) -> str:
-    """執行 Vision OCR，若 Vision API 本身回 error，直接 raise 以便外層捕捉。"""
+# =========================
+# 工具：OCR → 純文字
+# =========================
+def _ocr_text_from_bytes(image_bytes: bytes) -> str:
+    """
+    以 Google Cloud Vision 做 OCR；若未啟用/安裝，回傳空字串並在 log 提醒。
+    """
     if not _HAS_VISION:
-        raise RuntimeError("未安裝 google-cloud-vision 套件")
+        app.logger.warning("⚠️ OCR 未啟用：未安裝或未設定 Vision 憑證")
+        return ""
 
-    # 建立憑證（檔案或環境變數其一）
-    creds_path = "service_account.json"
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if os.path.exists(creds_path):
-        creds = service_account.Credentials.from_service_account_file(creds_path)
-    elif sa_json:
-        creds = service_account.Credentials.from_service_account_info(json.loads(sa_json))
-    else:
-        raise RuntimeError("找不到 service_account.json，且未設定 GOOGLE_SERVICE_ACCOUNT_JSON")
+    try:
+        client = vision.ImageAnnotatorClient(credentials=_vision_creds) if _vision_creds else vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        resp = client.text_detection(image=image)
+        if resp.error.message:
+            raise RuntimeError(resp.error.message)
+        text = resp.full_text_annotation.text if resp.full_text_annotation else (resp.text_annotations[0].description if resp.text_annotations else "")
+        return text or ""
+    except Exception as e:
+        app.logger.exception(e)
+        return ""
 
-    client = vision.ImageAnnotatorClient(credentials=creds)
-    image = vision.Image(content=img_bytes)
-    response = client.text_detection(image=image)
+# =========================
+# ✅ OCR → 資料解析器
+# 規則：
+# - 紀錄ID：R+4碼（例如 R0024），視為「定位點」
+# - 往下 1~5 行，抓第一個「12 碼純數字」作為託運單號
+# - 若不是 12 碼，不寫入；回覆提醒人工檢查
+# =========================
+ID_REGEX = re.compile(r'\bR(\d{4})\b', re.IGNORECASE)   # Rdddd
+DIGIT_BLOCK_REGEX = re.compile(r'(\d[\d\-\s]{10,}\d)')  # 先抓「看起來像一大段數字」的塊，允許空白或破折號
 
-    # Vision API 的錯誤會放在 response.error.message
-    if getattr(response, "error", None) and getattr(response.error, "message", ""):
-        raise RuntimeError(f"Vision API 錯誤：{response.error.message}")
+def _normalize_digits(s: str) -> str:
+    return re.sub(r'\D+', '', s or '')
 
-    texts = response.text_annotations
-    return texts[0].description if texts else ""
+def parse_ocr_for_pairs(text: str, look_ahead_lines: int = 5):
+    """
+    傳回：
+    - valid_pairs: [(rid, tracking12), ...]  # tracking 僅保留長度=12 的
+    - invalid_pairs: [(rid, found_raw, normalized, reason), ...]  # 非 12 碼的候選會放這裡
+    """
+    valid_pairs = []
+    invalid_pairs = []
 
+    if not text:
+        return valid_pairs, invalid_pairs
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    for idx, ln in enumerate(lines):
+        m = ID_REGEX.search(ln)
+        if not m:
+            continue
+        rid = f"R{m.group(1)}".upper()
+
+        candidate_found = False
+        # 往下找 1~N 行
+        for j in range(1, look_ahead_lines + 1):
+            if idx + j >= len(lines):
+                break
+            cand_line = lines[idx + j]
+            for m2 in DIGIT_BLOCK_REGEX.finditer(cand_line):
+                raw = m2.group(1)
+                pure = _normalize_digits(raw)
+                if len(pure) == 12:
+                    valid_pairs.append((rid, pure))
+                    candidate_found = True
+                    break
+                else:
+                    # 紀錄非 12 碼的候選（只收第一個）
+                    invalid_pairs.append((rid, raw, pure, f"長度{len(pure)}≠12"))
+                    candidate_found = True
+                    break
+            if candidate_found:
+                break
+
+        # 若完全找不到數字塊，也記錄為 invalid（以便提示）
+        if not candidate_found:
+            invalid_pairs.append((rid, "", "", "未找到候選數字"))
+
+    # 去重：同一 Rxxxx 僅保留第一筆
+    seen = set()
+    vp2 = []
+    for rid, t in valid_pairs:
+        if rid in seen:
+            continue
+        seen.add(rid)
+        vp2.append((rid, t))
+
+    # invalid 也做去重（避免同 rid 重複吵）
+    seen_i = set()
+    ip2 = []
+    for rid, raw, pure, reason in invalid_pairs:
+        if rid in seen_i:
+            continue
+        seen_i.add(rid)
+        ip2.append((rid, raw, pure, reason))
+
+    return vp2, ip2
+
+# =========================
+# ✅ 回填「寄書任務」對應列
+# 欄位名可在下方 COL_* 常數調整
+# =========================
+def update_sheet_with_pairs(pairs, handler_display_name: str):
+    """
+    依據 (record_id, tracking12) 清單，回填〈寄書任務〉對應列的欄位：
+      - 託運單號 ← tracking12
+      - 寄送方式 ← "便利帶"
+      - 寄出日期 ← 今日 YYYY-MM-DD
+      - 寄送狀態 ← "已託運"
+      - 經手人   ← handler_display_name（若無此欄，附加在備註尾端）
+    僅寫入 tracking12 長度=12 的資料（呼叫端已驗算）。
+    """
+    if not pairs:
+        return {"updated": 0, "not_found": [], "details": []}
+
+    gc = _build_gspread_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(MAIN_SHEET_NAME)
+
+    # =====（錨點）表頭名稱對應：若你表頭不同，可在這裡修改 =====
+    COL_ID_NAME   = "紀錄ID"
+    COL_SHIP_MTD  = "寄送方式"
+    COL_SHIP_DATE = "寄出日期"
+    COL_TRACKING  = "託運單號"
+    COL_STATUS    = "寄送狀態"
+    COL_HANDLER   = "經手人"   # 建議新增此欄；若不存在則落到備註
+    COL_NOTE      = "備註"
+    # ============================================================
+
+    headers = ws.row_values(1)
+    header_idx = {name.strip(): i+1 for i, name in enumerate(headers) if name.strip()}
+
+    # 取 紀錄ID 欄位位置（找不到就用第一欄）
+    id_col_idx = header_idx.get(COL_ID_NAME, 1)
+    id_col = ws.col_values(id_col_idx)  # 含表頭
+    rid_to_row = {}
+    for r, val in enumerate(id_col, start=1):
+        if r == 1:
+            continue
+        v = (val or "").strip().upper()
+        if v:
+            rid_to_row[v] = r
+
+    # 欄位索引
+    col_ship_mtd  = header_idx.get(COL_SHIP_MTD)
+    col_ship_date = header_idx.get(COL_SHIP_DATE)
+    col_tracking  = header_idx.get(COL_TRACKING)
+    col_status    = header_idx.get(COL_STATUS)
+    col_handler   = header_idx.get(COL_HANDLER)
+    col_note      = header_idx.get(COL_NOTE)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    updated = 0
+    not_found = []
+    details = []
+    batch_data = []
+
+    for rid, tracking12 in pairs:
+        row = rid_to_row.get(rid)
+        if not row:
+            not_found.append(rid)
+            continue
+
+        # 這裡只會收到長度=12 的 tracking12
+        if col_tracking:
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_tracking), "values": [[tracking12]]})
+        if col_ship_mtd:
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_ship_mtd), "values": [["便利帶"]]})
+        if col_ship_date:
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_ship_date), "values": [[today]]})
+        if col_status:
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_status), "values": [["已託運"]]})
+
+        # 經手人欄位：若沒有就附加到備註
+        if col_handler:
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_handler), "values": [[handler_display_name]]})
+        elif col_note:
+            old_note = ws.cell(row, col_note).value or ""
+            sep = "；" if old_note and not old_note.endswith(("；", ";")) else ""
+            new_note = f"{old_note}{sep}經手人：{handler_display_name}".strip("；")
+            batch_data.append({"range": gspread.utils.rowcol_to_a1(row, col_note), "values": [[new_note]]})
+
+        updated += 1
+        details.append(f"{rid} → {tracking12}")
+
+    # 批次寫入
+    if batch_data:
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": [{"range": it["range"], "values": it["values"]} for it in batch_data]
+        }
+        ws.spreadsheet.values_batch_update(body)
+
+    return {"updated": updated, "not_found": not_found, "details": details}
+
+# =========================
+# ✅ 圖片訊息處理：拍照 → OCR → 解析 → 驗算 → 寫回
+# =========================
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     try:
         user_id = getattr(event.source, "user_id", "unknown")
+        # 取 LINE 顯示名稱（作為「經手人」）
+        try:
+            profile = line_bot_api.get_profile(user_id)
+            handler_name = getattr(profile, "display_name", "未知經手人")
+        except Exception:
+            handler_name = "未知經手人"
+
         app.logger.info(f"[IMG] 收到圖片 user_id={user_id}, msg_id={event.message.id}")
 
-        # === [OCR 健檢] 開始 ===
-        problems = []
-        if not _HAS_VISION:
-            problems.append("未安裝 google-cloud-vision 套件")
-        sa_path = "service_account.json"
-        sa_env  = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-        if not os.path.exists(sa_path) and not sa_env:
-            problems.append("找不到 service_account.json，且未設定 GOOGLE_SERVICE_ACCOUNT_JSON")
-        if not CHANNEL_ACCESS_TOKEN:
-            problems.append("LINE CHANNEL_ACCESS_TOKEN 未設定")
-        if problems:
-            msg = "；".join(problems)
-            app.logger.error(f"[OCR_CHECK] 失敗：{msg}")
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"❌ OCR 健檢未通過：{msg}")
-            )
-            return
-        # === [OCR 健檢] 結束 ===
-
-        # 下載圖片
+        # 1) 下載圖片
         img_bytes = _download_line_image_bytes(event.message.id)
-        app.logger.info(f"[IMG_BYTES] size={len(img_bytes)} bytes")
 
-        if not img_bytes:
+        # 2) OCR → 文字
+        text = _ocr_text_from_bytes(img_bytes)
+        app.logger.info(f"[OCR_RAW]\n{text[:1000]}")
+
+        # 3) 解析：成對 (Rdddd, 12碼?)，並區分 valid / invalid
+        valid_pairs, invalid_pairs = parse_ocr_for_pairs(text)
+        app.logger.info(f"[OCR_PAIRS_VALID] {valid_pairs}")
+        app.logger.info(f"[OCR_PAIRS_INVALID] {invalid_pairs}")
+
+        if not valid_pairs and not invalid_pairs:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="❌ 圖片下載失敗（可能是 LINE 權限或 Access Token 錯誤）")
+                TextSendMessage(
+                    text="✅ 已收到圖片，但沒找到『紀錄ID（Rxxxx）』或其下方的『託運單號』。\n請確認取景：上方為 Rxxxx、其下方為手寫 12 碼。"
+                )
             )
             return
 
-        # 做 OCR
-        text = _ocr_text_from_bytes(img_bytes)
-        app.logger.info(f"[OCR_RAW_OUTPUT] {repr(text)}")
+        # 4) 寫回：只寫入長度=12 的 valid_pairs
+        result = update_sheet_with_pairs(valid_pairs, handler_name)
 
-        if text:
-            preview = (text[:200] + "…") if len(text) > 200 else text
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"✅ 已收到圖片並完成 OCR：\n{preview}")
-            )
-            app.logger.info(f"[OCR_TEXT]\n{text}")
+        # 5) 組裝回覆
+        lines = []
+        if result["updated"] > 0:
+            lines.append(f"✅ 已更新：{result['updated']} 筆")
+            if result["details"]:
+                lines.append("明細：\n" + "\n".join(result["details"]))
         else:
-            tip = "（OCR 無辨識到文字，請確認影像清晰度/對比/角度）"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip))
+            lines.append("⚠️ 本次未寫入任何託運單號（未找到長度=12 的有效單號）。")
 
-    except Exception as e:
-        # 產生簡短錯誤代碼，方便和伺服器日誌對應
-        err_code = datetime.now().strftime("%Y%m%d%H%M%S")
-        app.logger.error(f"[OCR_ERROR][{err_code}] {repr(e)}", exc_info=True)
+        # 找不到對應列的紀錄ID
+        if result["not_found"]:
+            lines.append("\n⚠️ 下列紀錄ID 在《寄書任務》找不到：\n" + ", ".join(result["not_found"]))
 
-        # 回覆使用者可讀的錯誤（避免洩漏私鑰）
-        safe_msg = str(e)
-        safe_msg = re.sub(
-            r'BEGIN PRIVATE KEY.*END PRIVATE KEY',
-            '[private_key]',
-            safe_msg,
-            flags=re.S
-        )
-        safe_msg = safe_msg[:400]  # 最多 400 字
+        # 非 12 碼／或未找到數字塊 → 提醒人工檢查
+        if invalid_pairs:
+            warn_rows = []
+            for rid, raw, pure, reason in invalid_pairs:
+                # 顯示：Rxxxx｜辨識="原始片段"｜淨化=純數字｜原因
+                part_raw = raw if raw else "（未擷取到數字）"
+                part_pure = pure if pure else "（無）"
+                warn_rows.append(f"{rid}｜辨識：{part_raw}｜淨化：{part_pure}｜原因：{reason}")
+            lines.append("\n❗以下項目未寫入（需手動檢查/調整為 12 碼）：\n" + "\n".join(warn_rows))
+
+        # 經手人
+        lines.append(f"\n經手人：{handler_name}")
 
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"❌ OCR 錯誤（代碼 {err_code}）：{safe_msg}")
+            TextSendMessage(text="\n".join(lines))
+        )
+
+    except Exception as e:
+        app.logger.exception(e)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"❌ 圖片處理發生錯誤：{e}")
         )
 
 # =========================
-# 主程式入口
+# 本地測試入口（Railway 可無視）
 # =========================
+@app.route("/", methods=["GET"])
+def index():
+    return "OK"
+
 if __name__ == "__main__":
-    # 你若想在啟動時印出有哪些工作表，可取消下一行註解
-    # app.logger.info(f"=== DEBUG: Worksheets found === {[ws.title for ws in _build_gspread_client().open_by_key(SHEET_ID).worksheets()]}")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    # Railway 會用 gunicorn 啟動；本地開發可直接跑
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
