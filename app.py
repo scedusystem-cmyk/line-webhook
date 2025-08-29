@@ -1,10 +1,13 @@
 # app.py
 # ============================================
-# 尚進《寄書＋進銷存 自動化機器人》— 18項最終版 實作
+# 《寄書＋進銷存 自動化機器人》— 完整版
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
-# 重點：建檔「上新下舊」、查詢回覆樣式、Vision用Service Account顯式建立
-# 並依你要求：
-# ① detect_delivery_method 只偵測便利商店；② 無便利商店但有地址 → 寄送方式=「便利帶」
+# 特點：
+# - 建檔「上新下舊」（插入第2列）
+# - 寄送方式：只偵測便利商店；若未偵測且有地址 → 自動設為「便利帶」
+# - 查詢回覆樣式（待處理/已託運）
+# - OCR 寫回（單號/出貨日/經手人/狀態）
+# - 取消寄書（軟刪除）：#取消寄書（權限=建單人同名、Y/N 確認、整列套刪除線）
 # ============================================
 
 from flask import Flask, request, abort
@@ -33,9 +36,6 @@ except Exception:
     _HAS_VISION = False
 # ==================================
 
-# ============================================
-# 基本設定
-# ============================================
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 
@@ -111,7 +111,7 @@ def now_str_min():
 def today_str():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
-def normalize_phone(s: str) -> str | None:
+def normalize_phone(s: str):
     digits = re.sub(r"\D+", "", s or "")
     if len(digits) == 10 and digits.startswith("09"):
         return digits
@@ -134,16 +134,23 @@ def parse_kv_lines(text: str):
         data.setdefault(k, []).append(v)
     return data
 
+def col_to_letter(col: int) -> str:
+    s = ""
+    while col > 0:
+        col, r = divmod(col - 1, 26)
+        s = chr(r + 65) + s
+    return s
+
 # ============================================
 # 寄送方式偵測（只偵測便利商店；其餘交由後續規則）
 # ============================================
-def detect_delivery_method(text: str) -> str | None:
+def detect_delivery_method(text: str):
     s = (text or "").lower().replace("—", "-").replace("／", "/")
     if any(k in s for k in ["7-11","7/11","7／11","7–11","711","小七"]): return "7-11"
     if "全家" in s or "family" in s: return "全家"
     if "萊爾富" in s or "hi-life" in s or "hilife" in s: return "萊爾富"
     if "ok" in s or "ok超商" in s: return "OK"
-    return None   # 不偵測宅配；未命中便利商店則交由下一步處理
+    return None
 
 # ============================================
 # 郵遞區號查找（前置）
@@ -181,7 +188,7 @@ def _load_zipref():
         _zip_cache = []
         return _zip_cache
 
-def lookup_zip(address: str) -> str | None:
+def lookup_zip(address: str):
     if not address:
         return None
     pairs = _load_zipref()
@@ -326,7 +333,7 @@ def _build_insert_row(ws, data, who_display_name):
     row[idxE-1] = f"'{phone}" if phone else ""
     address = data.get("address","")
 
-    # 郵遞區號：僅在（未指定 or 空 or 宅配）才補；「便利帶」不補（依你目前規則）
+    # 郵遞區號：僅在（未指定/空/宅配）才補；「便利帶」不補
     if WRITE_ZIP_TO_ADDRESS and (data.get("delivery") in (None, "", "宅配")) and address:
         z = lookup_zip(address)
         if z and not re.match(r"^\d{3}", address):
@@ -335,7 +342,7 @@ def _build_insert_row(ws, data, who_display_name):
 
     row[idxG-1] = data.get("book_formal","")
     row[idxH-1] = data.get("biz_note","")
-    row[idxI-1] = data.get("delivery") or ""  # 未偵測→留白（之後可能成為「便利帶」，見解析步驟）
+    row[idxI-1] = data.get("delivery") or ""
     row[idxJ-1] = ""
     row[idxK-1] = ""
     row[idxL-1] = ""
@@ -344,7 +351,7 @@ def _build_insert_row(ws, data, who_display_name):
     return row, {"rid": rid}
 
 # ============================================
-# 解析＋指令處理
+# 解析＋指令處理（建立寄書）
 # ============================================
 def _parse_new_order_text(raw_text: str):
     """
@@ -353,13 +360,14 @@ def _parse_new_order_text(raw_text: str):
     """
     data = parse_kv_lines(raw_text)
 
-    # 先抓核心欄位
+    # 1) 姓名
     name = None
     for k in list(data.keys()):
         if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
             name = "、".join(data.pop(k))
             break
 
+    # 2) 電話
     phone = None
     for k in list(data.keys()):
         if "電話" in k:
@@ -370,6 +378,7 @@ def _parse_new_order_text(raw_text: str):
                     break
             break
 
+    # 3) 地址
     address = None
     for k in list(data.keys()):
         if any(x in k for x in ["寄送地址","地址","收件地址","配送地址"]):
@@ -377,6 +386,7 @@ def _parse_new_order_text(raw_text: str):
             address = address.replace(" ", "")
             break
 
+    # 4) 書名
     book_raw = None
     for k in list(data.keys()):
         if any(x in k for x in ["書","書名","教材","書籍名稱"]):
@@ -387,7 +397,7 @@ def _parse_new_order_text(raw_text: str):
     merged_text = "\n".join(sum(data.values(), []))
     delivery = detect_delivery_method(merged_text)
 
-    # ② 若沒偵測到便利商店、但有地址 → 寄送方式=「便利帶」
+    # 若未偵測到便利商店、但有地址 → 寄送方式=「便利帶」
     if not delivery and address:
         delivery = "便利帶"
 
@@ -401,7 +411,7 @@ def _parse_new_order_text(raw_text: str):
                 others.append(v)
     biz_note = " / ".join([x for x in others if x.strip()])
 
-    # 驗證必填（若非便利商店需地址）
+    # 驗證（若非便利商店需地址）
     errors = []
     if not name: errors.append("缺少【姓名】")
     if not phone: errors.append("電話格式錯誤（需 09 開頭 10 碼）")
@@ -415,12 +425,11 @@ def _parse_new_order_text(raw_text: str):
         "address": address,
         "book_raw": book_raw,
         "biz_note": biz_note,
-        "delivery": delivery,      # 可能是 7-11/全家/OK/萊爾富 或 便利帶 或 None
+        "delivery": delivery,
         "raw_text": raw_text
     }, errors
 
 def _handle_new_order(event, text):
-    # 取得使用者顯示名稱
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
         display_name = profile.display_name
@@ -433,7 +442,6 @@ def _handle_new_order(event, text):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
-    # 書名解析 → 正式名
     book_formal, kind, extra = resolve_book_name(parsed["book_raw"])
     if not book_formal:
         if kind == "ambiguous" and extra:
@@ -446,11 +454,8 @@ def _handle_new_order(event, text):
 
     ws = _ws(MAIN_SHEET_NAME)
     row, meta = _build_insert_row(ws, parsed, display_name)
+    ws.insert_row(row, index=2, value_input_option="USER_ENTERED")  # 上新下舊
 
-    # 上新下舊：插入第 2 列
-    ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
-
-    # 成功回覆
     resp = (
         "✅ 已成功建檔\n"
         f"紀錄ID：{meta['rid']}\n"
@@ -462,12 +467,16 @@ def _handle_new_order(event, text):
     )
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
 
+# ============================================
+# 查詢寄書（預設不顯示「已刪除」）
+# ============================================
 def _handle_query(event, text):
     q = re.sub(r"^#(查詢寄書|查寄書)\s*", "", text.strip())
 
     ws = _ws(MAIN_SHEET_NAME)
     h = _get_header_map(ws)
     idxB = _col_idx(h, "建單日期", 2)
+    idxC = _col_idx(h, "建單人", 3)
     idxD = _col_idx(h, "學員姓名", 4)
     idxE = _col_idx(h, "學員電話", 5)
     idxG = _col_idx(h, "書籍名稱", 7)
@@ -485,6 +494,9 @@ def _handle_query(event, text):
     results = []
     for r in rows:
         try:
+            st = (r[idxM-1] or "").strip()
+            if st == "已刪除":
+                continue  # 預設不顯示已刪除
             dt_str = r[idxB-1].strip()
             dt = None
             if dt_str:
@@ -506,15 +518,12 @@ def _handle_query(event, text):
             continue
 
     if not results:
-        msg = "❌ 查無近 30 天內的寄書紀錄，請確認姓名或電話是否正確。"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 查無近 30 天內的寄書紀錄，請確認姓名或電話是否正確。"))
         return
 
-    # 新→舊排序
     results.sort(key=lambda r: r[idxB-1], reverse=True)
     results = results[:5]
 
-    # 回覆樣式
     blocks = []
     for r in results:
         name = r[idxD-1]
@@ -526,18 +535,240 @@ def _handle_query(event, text):
 
         if status == "已託運":
             lines = [f"📦 {name} 的 {book}"]
-            if outd:
-                lines.append(f"已於 {outd}")
-            if ship:
-                lines.append(f"由 {ship} 寄出")
-            if no:
-                lines.append(f"託運單號：{no}")
+            if outd: lines.append(f"已於 {outd}")
+            if ship: lines.append(f"由 {ship} 寄出")
+            if no:   lines.append(f"託運單號：{no}")
             blocks.append("\n".join(lines))
         else:
             blocks.append(f"📦 {name} 的 {book} {status or '待處理'}")
 
     msg = "\n\n".join(blocks)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+# ============================================
+# 取消寄書（軟刪除）
+# 指令：#取消寄書  [姓名/電話 可同時]
+# 權限：建單人（C欄）須等於操作者的 LINE 顯示名稱
+# 確認：顯示摘要，要求回覆 Y/N
+# ============================================
+_PENDING = {}  # user_id -> pending dict
+
+def _extract_cancel_target(text: str):
+    """
+    從 '#取消寄書 ...' 取得姓名/電話。
+    支援：同一行或多行鍵值（學員姓名/學員電話）
+    """
+    body = re.sub(r"^#取消寄書\s*", "", text.strip())
+    name, phone = None, None
+
+    # 先從鍵值行找
+    data = parse_kv_lines(body)
+    for k in list(data.keys()):
+        if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
+            name = "、".join(data.pop(k))
+            break
+    for k in list(data.keys()):
+        if "電話" in k:
+            for v in data.pop(k):
+                p = normalize_phone(v)
+                if p:
+                    phone = p
+                    break
+            break
+
+    # 若仍沒有，再從同一行自由文字嘗試
+    if not name or not phone:
+        tokens = re.split(r"\s+", body)
+        for t in tokens:
+            tt = t.strip()
+            if not tt:
+                continue
+            p = normalize_phone(tt)
+            if (not phone) and p:
+                phone = p
+                continue
+            if not name and not re.search(r"\d", tt):
+                name = tt
+
+    return (name, phone)
+
+def _find_latest_order(ws, name, phone):
+    """依姓名/電話（後9碼）在近 QUERY_DAYS 內找最新一筆；回傳 (row_index, row_values) 或 (None, None)"""
+    h = _get_header_map(ws)
+    idxA = _col_idx(h, "紀錄ID", 1)
+    idxB = _col_idx(h, "建單日期", 2)
+    idxC = _col_idx(h, "建單人", 3)
+    idxD = _col_idx(h, "學員姓名", 4)
+    idxE = _col_idx(h, "學員電話", 5)
+    idxM = _col_idx(h, "寄送狀態", 13)
+
+    all_vals = ws.get_all_values()
+    rows = all_vals[1:]
+    since = datetime.now(TZ) - timedelta(days=QUERY_DAYS)
+
+    phone_suffix = None
+    if phone:
+        pd = re.sub(r"\D+","", phone)
+        if len(pd) >= PHONE_SUFFIX_MATCH:
+            phone_suffix = pd[-PHONE_SUFFIX_MATCH:]
+
+    candidates = []
+    for ridx, r in enumerate(rows, start=2):
+        try:
+            dt_str = (r[idxB-1] or "").strip()
+            dt = None
+            if dt_str:
+                try:
+                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                except Exception:
+                    dt = None
+            if dt and dt < since:
+                continue
+
+            ok = True
+            if name and name not in (r[idxD-1] or ""):
+                ok = False
+            if phone_suffix:
+                cand = re.sub(r"\D+","", r[idxE-1] or "")
+                if not (len(cand) >= PHONE_SUFFIX_MATCH and cand[-PHONE_SUFFIX_MATCH:] == phone_suffix):
+                    ok = False
+            if ok:
+                candidates.append((ridx, r))
+        except Exception:
+            continue
+
+    if not candidates:
+        return (None, None)
+
+    # 取建單日期新者；若同字串排序也可
+    candidates.sort(key=lambda x: x[1][idxB-1], reverse=True)
+    return candidates[0]
+
+def _format_row_strikethrough(ws, row_i):
+    """整行套刪除線樣式"""
+    header_len = len(ws.row_values(1))
+    last_col = max(header_len, 13)
+    rng = f"A{row_i}:{col_to_letter(last_col)}{row_i}"
+    try:
+        ws.format(rng, {"textFormat": {"strikethrough": True}})
+    except Exception:
+        # Fallback
+        ss.batch_update({
+            "requests": [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": row_i-1,
+                        "endRowIndex": row_i,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": last_col
+                    },
+                    "cell": {"userEnteredFormat": {"textFormat": {"strikethrough": True}}},
+                    "fields": "userEnteredFormat.textFormat.strikethrough"
+                }
+            }]
+        })
+
+def _handle_cancel_request(event, text):
+    # 取操作者顯示名稱
+    try:
+        profile = line_bot_api.get_profile(event.source.user_id)
+        display_name = profile.display_name or "LINE使用者"
+    except Exception:
+        display_name = "LINE使用者"
+
+    name, phone = _extract_cancel_target(text)
+    ws = _ws(MAIN_SHEET_NAME)
+    h = _get_header_map(ws)
+    idxA = _col_idx(h, "紀錄ID", 1)
+    idxB = _col_idx(h, "建單日期", 2)
+    idxC = _col_idx(h, "建單人", 3)
+    idxD = _col_idx(h, "學員姓名", 4)
+    idxG = _col_idx(h, "書籍名稱", 7)
+    idxJ = _col_idx(h, "寄出日期", 10)
+    idxK = _col_idx(h, "託運單號", 11)
+    idxL = _col_idx(h, "經手人", 12)
+    idxM = _col_idx(h, "寄送狀態", 13)
+    idxH = _col_idx(h, "業務備註", 8)
+
+    row_i, r = _find_latest_order(ws, name, phone)
+    if not row_i:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到紀錄"))
+        return
+
+    # 權限：建單人=操作者名稱
+    creator = (r[idxC-1] or "").strip() or "LINE使用者"
+    if creator != display_name:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 你沒有刪除權限（請聯繫管理者）"))
+        return
+
+    status = (r[idxM-1] or "").strip()
+    outd = (r[idxJ-1] or "").strip()
+    shipno = (r[idxK-1] or "").strip()
+    if status == "已託運":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 已託運，無法刪除"))
+        return
+    if status == "已刪除":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 已是已刪除狀態"))
+        return
+    if (shipno or outd) and status != "已託運":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 無法處理，請私訊客服。"))
+        return
+
+    # 提示確認（Y/N）
+    stu = r[idxD-1]
+    book = r[idxG-1]
+    _PENDING[event.source.user_id] = {
+        "type": "cancel_order",
+        "sheet": MAIN_SHEET_NAME,
+        "row_i": row_i,
+        "rid": r[idxA-1],
+        "stu": stu,
+        "book": book,
+        "status": status,
+        "operator": display_name,
+        "idx": {"H": idxH, "L": idxL, "M": idxM}
+    }
+    prompt = f"請確認是否刪除：\n學員：{stu}\n書名：{book}\n狀態：{status or '待處理'}\n[Y/N]"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=prompt))
+
+def _handle_pending_answer(event, text):
+    pend = _PENDING.get(event.source.user_id)
+    if not pend:
+        return False  # 沒有待處理
+    ans = text.strip().upper()
+    if ans not in ("Y","N"):
+        return False
+    if ans == "N":
+        _PENDING.pop(event.source.user_id, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已結束對話。"))
+        return True
+
+    # Y：執行軟刪除
+    ws = _ws(pend["sheet"])
+    row_i = pend["row_i"]
+    idxH = pend["idx"]["H"]
+    idxL = pend["idx"]["L"]
+    idxM = pend["idx"]["M"]
+
+    # 追加備註
+    try:
+        curr_h = ws.cell(row_i, idxH).value or ""
+    except Exception:
+        curr_h = ""
+    append_note = f"[已刪除 {now_str_min()}]"
+    new_h = (curr_h + " " + append_note).strip() if curr_h else append_note
+
+    ws.update_cell(row_i, idxH, new_h)
+    ws.update_cell(row_i, idxL, pend["operator"])
+    ws.update_cell(row_i, idxM, "已刪除")
+    _format_row_strikethrough(ws, row_i)
+
+    # 成功訊息
+    msg = f"✅ 寄書任務已刪除：{pend['stu']} 的 {pend['book']}"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    _PENDING.pop(event.source.user_id, None)
+    return True
 
 # ============================================
 # 圖片（OCR）處理：寫回單號/出貨日/經手人/狀態
@@ -610,13 +841,12 @@ def _write_ocr_results(pairs, event):
     except Exception:
         uploader = "LINE使用者"
 
-    # 索引：紀錄ID → row
     all_vals = ws.get_all_values()
     rows = all_vals[1:]
     id2row = {}
     for ridx, r in enumerate(rows, start=2):
         try:
-            rid = r[idxA-1].strip()
+            rid = (r[idxA-1] or "").strip()
             if re.fullmatch(r"R\d{4}", rid):
                 id2row[rid] = ridx
         except Exception:
@@ -657,13 +887,23 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = (event.message.text or "").strip()
+
+    # 先處理待確認的 Y/N
+    if _handle_pending_answer(event, text):
+        return
+
     if text.startswith("#寄書需求") or text.startswith("#寄書"):
         _handle_new_order(event, text); return
+
     if text.startswith("#查詢寄書") or text.startswith("#查寄書"):
         _handle_query(event, text); return
+
+    if text.startswith("#取消寄書"):
+        _handle_cancel_request(event, text); return
+
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text="請使用：\n#寄書（建立寄書任務）\n#查寄書（姓名或電話）")
+        TextSendMessage(text="請使用：\n#寄書（建立寄書任務）\n#查寄書（姓名或電話）\n#取消寄書（姓名或電話）")
     )
 
 # 圖片訊息處理（OCR）
