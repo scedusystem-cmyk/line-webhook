@@ -2,7 +2,9 @@
 # ============================================
 # 尚進《寄書＋進銷存 自動化機器人》— 18項最終版 實作
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
-# 關鍵：建檔「上新下舊」（插入第2列）、查詢回覆樣式、Vision用Service Account顯式建立
+# 重點：建檔「上新下舊」、查詢回覆樣式、Vision用Service Account顯式建立
+# 並依你要求：
+# ① detect_delivery_method 只偵測便利商店；② 無便利商店但有地址 → 寄送方式=「便利帶」
 # ============================================
 
 from flask import Flask, request, abort
@@ -64,7 +66,7 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 TZ = ZoneInfo("Asia/Taipei")
 
 # ============================================
-# 功能 D：Google Sheets 連線 + 表頭對應
+# Google Sheets 連線 + 表頭對應
 # ============================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -72,7 +74,6 @@ SCOPES = [
 ]
 
 def _build_gspread_client():
-    # 兩種取得 service account 憑證的方法：檔案或環境變數
     json_path = "service_account.json"
     if os.path.exists(json_path):
         creds = Credentials.from_service_account_file(json_path, scopes=SCOPES)
@@ -90,7 +91,6 @@ def _ws(name: str):
     return ss.worksheet(name)
 
 def _get_header_map(ws):
-    """回傳 {欄名: index(1-based)}；自動對照目前表頭，避免欄位順序差異。"""
     header = ws.row_values(1)
     hmap = {}
     for idx, title in enumerate(header, start=1):
@@ -100,11 +100,10 @@ def _get_header_map(ws):
     return hmap
 
 def _col_idx(hmap, key, default_idx):
-    """依表頭名稱找欄位，找不到就用預設序（以目前規格為準）。"""
     return hmap.get(key, default_idx)
 
 # ============================================
-# 功能 F：工具與格式化
+# 工具與格式化
 # ============================================
 def now_str_min():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
@@ -119,47 +118,38 @@ def normalize_phone(s: str) -> str | None:
     return None
 
 def parse_kv_lines(text: str):
-    """
-    將多行文字用「：」、「:」等切出 key/value，回傳 dict（不做強制鍵名）。
-    """
     data = {}
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in lines:
-        if ln.startswith("#"):  # 指令行略過
+        if ln.startswith("#"):
             continue
         if "：" in ln:
             k, v = ln.split("：", 1)
         elif ":" in ln:
             k, v = ln.split(":", 1)
         else:
-            # 無法辨識的行保留，後面當作「業務備註」候選
             k, v = "_free_", ln
         k = k.strip()
         v = v.strip()
         data.setdefault(k, []).append(v)
     return data
 
+# ============================================
+# 寄送方式偵測（只偵測便利商店；其餘交由後續規則）
+# ============================================
 def detect_delivery_method(text: str) -> str | None:
     s = (text or "").lower().replace("—", "-").replace("／", "/")
-    # 支援模糊關鍵字
-    if any(k in s for k in ["7-11", "7/11", "7／11", "7–11", "711", "小七"]):
-        return "7-11"
-    if "全家" in s or "family" in s:
-        return "全家"
-    if "萊爾富" in s or "hi-life" in s or "hilife" in s:
-        return "萊爾富"
-    if "ok" in s or "ok超商" in s:
-        return "OK"
-    if "宅配" in s or "黑貓" in s or "宅急便" in s:
-        return "宅配"
-    return None  # 未偵測→留白
+    if any(k in s for k in ["7-11","7/11","7／11","7–11","711","小七"]): return "7-11"
+    if "全家" in s or "family" in s: return "全家"
+    if "萊爾富" in s or "hi-life" in s or "hilife" in s: return "萊爾富"
+    if "ok" in s or "ok超商" in s: return "OK"
+    return None   # 不偵測宅配；未命中便利商店則交由下一步處理
 
 # ============================================
-# 功能 E：郵遞區號查找（前置）
+# 郵遞區號查找（前置）
 # ============================================
 _zip_cache = None
 def _load_zipref():
-    """讀取郵遞區號表，做簡單的「最長前綴」匹配。容錯多種欄位命名。"""
     global _zip_cache
     if _zip_cache is not None:
         return _zip_cache
@@ -170,13 +160,10 @@ def _load_zipref():
         zi, ai = None, None
         for i, name in enumerate(header):
             n = str(name).strip()
-            if zi is None and re.search(r"郵遞區號|郵遞|zip|ZIP", n, re.I):
-                zi = i
-            if ai is None and re.search(r"地址|路|區|鄉|鎮|村|里|段|巷|市|縣", n):
-                ai = i
+            if zi is None and re.search(r"郵遞區號|郵遞|zip|ZIP", n, re.I): zi = i
+            if ai is None and re.search(r"地址|路|區|鄉|鎮|村|里|段|巷|市|縣", n): ai = i
         if zi is None or ai is None:
-            zi = 1
-            ai = 0
+            zi, ai = 1, 0
         pairs = []
         for r in rows[1:]:
             try:
@@ -205,7 +192,7 @@ def lookup_zip(address: str) -> str | None:
     return None
 
 # ============================================
-# 功能 B：書名比對（正式名 / 別名 / 模糊）
+# 書名比對
 # ============================================
 def load_book_master():
     ws = _ws(BOOK_MASTER_SHEET_NAME)
@@ -213,7 +200,6 @@ def load_book_master():
     if not rows:
         return []
     header = rows[0]
-    # 主要欄位推測：A=是否啟用、B=書籍名稱、K=模糊比對書名
     use_idx = 0
     name_idx = 1
     alias_idx = None
@@ -233,44 +219,30 @@ def load_book_master():
             if alias_raw:
                 aliases = re.split(r"[、,\s\|／/]+", alias_raw)
                 aliases = [a.strip() for a in aliases if a.strip()]
-            data.append({
-                "name": name,
-                "aliases": aliases
-            })
+            data.append({"name": name, "aliases": aliases})
         except Exception:
             continue
     return data
 
 def resolve_book_name(user_input: str):
-    """
-    回傳 (正式書名, 來源型態)；來源型態：exact/alias/fuzzy
-    若無法唯一決定，回傳 (None, 'ambiguous' or 'notfound', 候選清單)
-    """
     src = (user_input or "").strip()
     if not src:
         return (None, "notfound", [])
     books = load_book_master()
-    # 1) 完全比對（正式名 or 別名）
     exact = [b for b in books if src.lower() == b["name"].lower()]
     if exact:
         return (exact[0]["name"], "exact", None)
     for b in books:
         if any(src.lower() == a.lower() for a in b["aliases"]):
             return (b["name"], "alias", None)
-    # 2) 模糊比對（對 正式名 + 別名）
-    cand = []
-    universe = []
-    reverse_map = {}
+    universe, reverse_map = [], {}
     for b in books:
-        universe.append(b["name"])
-        reverse_map[b["name"]] = b["name"]
+        universe.append(b["name"]); reverse_map[b["name"]] = b["name"]
         for a in b["aliases"]:
-            universe.append(a)
-            reverse_map[a] = b["name"]
+            universe.append(a); reverse_map[a] = b["name"]
     matches = difflib.get_close_matches(src, universe, n=5, cutoff=FUZZY_THRESHOLD)
     if not matches:
         return (None, "notfound", [])
-    # 映射回正式名並去重
     formal = []
     for m in matches:
         fm = reverse_map.get(m)
@@ -278,11 +250,10 @@ def resolve_book_name(user_input: str):
             formal.append(fm)
     if len(formal) == 1:
         return (formal[0], "fuzzy", None)
-    # 多筆候選，請使用者更明確
     return (None, "ambiguous", formal)
 
 # ============================================
-# 功能 G：Vision Client（顯式憑證建立，避免 ADC 錯誤）
+# Vision Client（顯式憑證建立，避免 ADC 錯誤）
 # ============================================
 def _build_vision_client():
     global _HAS_VISION, _vision_client
@@ -308,11 +279,11 @@ def _build_vision_client():
 _vision_client = _build_vision_client()
 
 # ============================================
-# 功能 A：文字訊息處理（#寄書 / #寄書需求、#查詢寄書 / #查寄書）
+# 建檔輔助
 # ============================================
 def _gen_next_record_id(ws, header_map):
     colA = _col_idx(header_map, "紀錄ID", 1)
-    values = ws.col_values(colA)[1:]  # 跳過表頭
+    values = ws.col_values(colA)[1:]
     max_no = 0
     for v in values:
         m = re.fullmatch(r"R(\d{4})", str(v).strip())
@@ -320,20 +291,15 @@ def _gen_next_record_id(ws, header_map):
             n = int(m.group(1))
             if n > max_no:
                 max_no = n
-    nxt = max_no + 1
-    return f"R{nxt:04d}"
+    return f"R{max_no+1:04d}"
 
 def _build_insert_row(ws, data, who_display_name):
     """
-    data 需包含：name, phone, address, book_formal, raw_text, delivery, biz_note
-    依照目前表頭（A~M）回傳可插入的列表（USER_ENTERED）。
-    欄位定義（你最新規格）：
-    A紀錄ID B建單日期 C建單人 D學員姓名 E學員電話 F寄送地址
-    G書籍名稱 H業務備註 I寄送方式 J寄出日期 K託運單號 L經手人 M寄送狀態
+    欄位：A紀錄ID B建單日期 C建單人 D學員姓名 E學員電話 F寄送地址
+          G書籍名稱 H業務備註 I寄送方式 J寄出日期 K託運單號 L經手人 M寄送狀態
     """
     hmap = _get_header_map(ws)
     header_len = len(ws.row_values(1))
-    # 預設索引
     idxA = _col_idx(hmap, "紀錄ID", 1)
     idxB = _col_idx(hmap, "建單日期", 2)
     idxC = _col_idx(hmap, "建單人", 3)
@@ -356,12 +322,11 @@ def _build_insert_row(ws, data, who_display_name):
     row[idxB-1] = now_str_min()
     row[idxC-1] = who_display_name or "LINE使用者"
     row[idxD-1] = data.get("name","")
-    # 手機以文字型態存（避免前導0被吃）：在值前加單引號
     phone = data.get("phone","")
     row[idxE-1] = f"'{phone}" if phone else ""
     address = data.get("address","")
 
-    # 宅配才補郵遞區號；超商可不強制門牌
+    # 郵遞區號：僅在（未指定 or 空 or 宅配）才補；「便利帶」不補（依你目前規則）
     if WRITE_ZIP_TO_ADDRESS and (data.get("delivery") in (None, "", "宅配")) and address:
         z = lookup_zip(address)
         if z and not re.match(r"^\d{3}", address):
@@ -370,31 +335,31 @@ def _build_insert_row(ws, data, who_display_name):
 
     row[idxG-1] = data.get("book_formal","")
     row[idxH-1] = data.get("biz_note","")
-    row[idxI-1] = data.get("delivery") or ""  # 未偵測→留白
-    row[idxJ-1] = ""  # 出貨時填
-    row[idxK-1] = ""  # 單號
-    row[idxL-1] = ""  # 經手人（OCR 時填）
+    row[idxI-1] = data.get("delivery") or ""  # 未偵測→留白（之後可能成為「便利帶」，見解析步驟）
+    row[idxJ-1] = ""
+    row[idxK-1] = ""
+    row[idxL-1] = ""
     row[idxM-1] = "待處理"
 
     return row, {"rid": rid}
 
+# ============================================
+# 解析＋指令處理
+# ============================================
 def _parse_new_order_text(raw_text: str):
     """
-    解析 #寄書 / #寄書需求 文字，輸出 dict 與錯誤清單
-    必填：姓名、電話、書名；地址（若非超商）
-    非姓名/電話/地址/書名/寄送方式 → 業務備註
+    解析 #寄書 / #寄書需求
+    必填：姓名、電話、書名；地址（若非便利商店寄送）
     """
     data = parse_kv_lines(raw_text)
-    merged_text = "\n".join(sum(data.values(), []))  # 用於寄送方式偵測
 
-    # 1) 姓名（常見鍵包含：姓名/學員姓名/收件人）
+    # 先抓核心欄位
     name = None
     for k in list(data.keys()):
         if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
             name = "、".join(data.pop(k))
             break
 
-    # 2) 電話
     phone = None
     for k in list(data.keys()):
         if "電話" in k:
@@ -405,7 +370,6 @@ def _parse_new_order_text(raw_text: str):
                     break
             break
 
-    # 3) 地址
     address = None
     for k in list(data.keys()):
         if any(x in k for x in ["寄送地址","地址","收件地址","配送地址"]):
@@ -413,17 +377,21 @@ def _parse_new_order_text(raw_text: str):
             address = address.replace(" ", "")
             break
 
-    # 4) 書名
     book_raw = None
     for k in list(data.keys()):
         if any(x in k for x in ["書","書名","教材","書籍名稱"]):
             book_raw = " ".join(data.pop(k)).strip()
             break
 
-    # 5) 寄送方式（偵測）
+    # 合併剩餘文字以利偵測便利商店
+    merged_text = "\n".join(sum(data.values(), []))
     delivery = detect_delivery_method(merged_text)
 
-    # 6) 其餘 → 業務備註
+    # ② 若沒偵測到便利商店、但有地址 → 寄送方式=「便利帶」
+    if not delivery and address:
+        delivery = "便利帶"
+
+    # 其他文字 → 業務備註
     others = []
     for k, arr in data.items():
         for v in arr:
@@ -433,7 +401,7 @@ def _parse_new_order_text(raw_text: str):
                 others.append(v)
     biz_note = " / ".join([x for x in others if x.strip()])
 
-    # 驗證必填（若非超商需地址）
+    # 驗證必填（若非便利商店需地址）
     errors = []
     if not name: errors.append("缺少【姓名】")
     if not phone: errors.append("電話格式錯誤（需 09 開頭 10 碼）")
@@ -447,12 +415,12 @@ def _parse_new_order_text(raw_text: str):
         "address": address,
         "book_raw": book_raw,
         "biz_note": biz_note,
-        "delivery": delivery,  # 未偵測→None
+        "delivery": delivery,      # 可能是 7-11/全家/OK/萊爾富 或 便利帶 或 None
         "raw_text": raw_text
     }, errors
 
 def _handle_new_order(event, text):
-    # 嘗試取得 LINE 顯示名稱
+    # 取得使用者顯示名稱
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
         display_name = profile.display_name
@@ -474,13 +442,12 @@ def _handle_new_order(event, text):
             msg = "❌ 找不到對應的書名，請確認或補充關鍵字。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
-
     parsed["book_formal"] = book_formal
 
     ws = _ws(MAIN_SHEET_NAME)
     row, meta = _build_insert_row(ws, parsed, display_name)
 
-    # ★ 插入第 2 列（上新下舊）
+    # 上新下舊：插入第 2 列
     ws.insert_row(row, index=2, value_input_option="USER_ENTERED")
 
     # 成功回覆
@@ -496,7 +463,6 @@ def _handle_new_order(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
 
 def _handle_query(event, text):
-    # 去掉指令字頭
     q = re.sub(r"^#(查詢寄書|查寄書)\s*", "", text.strip())
 
     ws = _ws(MAIN_SHEET_NAME)
@@ -513,14 +479,12 @@ def _handle_query(event, text):
     rows = ws.get_all_values()[1:]
     since = datetime.now(TZ) - timedelta(days=QUERY_DAYS)
 
-    # 判斷姓名 or 電話
     phone_digits = re.sub(r"\D+","", q)
     is_phone = len(phone_digits) >= 7
 
     results = []
     for r in rows:
         try:
-            # 時間窗
             dt_str = r[idxB-1].strip()
             dt = None
             if dt_str:
@@ -531,7 +495,6 @@ def _handle_query(event, text):
             if dt and dt < since:
                 continue
 
-            # 篩選
             if is_phone:
                 cand = re.sub(r"\D+","", r[idxE-1])
                 if len(cand) >= PHONE_SUFFIX_MATCH and phone_digits[-PHONE_SUFFIX_MATCH:] == cand[-PHONE_SUFFIX_MATCH:]:
@@ -547,13 +510,11 @@ def _handle_query(event, text):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
-    # 新→舊排序（以建單日期字串排序）
-    def sort_key(r):
-        return r[idxB-1]
-    results.sort(key=sort_key, reverse=True)
+    # 新→舊排序
+    results.sort(key=lambda r: r[idxB-1], reverse=True)
     results = results[:5]
 
-    # ★ 回覆樣式（依狀態切換）
+    # 回覆樣式
     blocks = []
     for r in results:
         name = r[idxD-1]
@@ -573,14 +534,13 @@ def _handle_query(event, text):
                 lines.append(f"託運單號：{no}")
             blocks.append("\n".join(lines))
         else:
-            # 待處理或其他狀態：單行顯示
             blocks.append(f"📦 {name} 的 {book} {status or '待處理'}")
 
     msg = "\n\n".join(blocks)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 # ============================================
-# 功能 C：OCR 圖片處理（出貨單→單號寫回/狀態更新）
+# 圖片（OCR）處理：寫回單號/出貨日/經手人/狀態
 # ============================================
 def _download_line_image_bytes(message_id: str) -> bytes:
     content = line_bot_api.get_message_content(message_id)
@@ -588,7 +548,7 @@ def _download_line_image_bytes(message_id: str) -> bytes:
 
 def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     if not _vision_client:
-        raise RuntimeError("Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON 已設定，且專案啟用 Vision API）。")
+        raise RuntimeError("Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON 已設定，且專案已啟用 Vision API）。")
     image = vision.Image(content=img_bytes)
     resp = _vision_client.text_detection(image=image)
     if resp.error.message:
@@ -597,34 +557,22 @@ def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     return text or ""
 
 def _pair_ids_with_numbers(text: str):
-    """
-    從 OCR 文本擷取 Rxxxx 與 12碼單號，嘗試「就近配對」；不複雜化。
-    回傳：(pairs, leftovers)
-    pairs: [(rid, no12)]
-    leftovers: 訊息列表（需人工）
-    """
     if not text:
         return [], ["未讀取到文字"]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if LOG_OCR_RAW:
         app.logger.info(f"[OCR_RAW_OUTPUT] {repr(text[:1000])}")
 
-    rids = []
-    nums = []
+    rids, nums = [], []
     for i, ln in enumerate(lines):
         for m in re.finditer(r"R\d{4}", ln):
             rids.append((m.group(), i))
         for m in re.finditer(r"\d{12}", ln):
             nums.append((m.group(), i))
 
-    pairs = []
-    used_num = set()
-    leftovers = []
-
-    # 簡單就近：每個 rid 找最近的 12 碼
+    pairs, used_num, leftovers = [], set(), []
     for rid, li in rids:
-        chosen = None
-        best_dist = 999
+        chosen, best_dist = None, 999
         for no, lj in nums:
             if (no, lj) in used_num:
                 continue
@@ -638,7 +586,6 @@ def _pair_ids_with_numbers(text: str):
         else:
             leftovers.append(f"{rid}｜未找到 12 碼單號")
 
-    # 多出的號碼
     for no, lj in nums:
         if (no, lj) not in used_num:
             leftovers.append(f"未配對單號：{no}")
@@ -656,18 +603,18 @@ def _write_ocr_results(pairs, event):
     idxL = _col_idx(h, "經手人", 12)
     idxM = _col_idx(h, "寄送狀態", 13)
 
-    # 取得上傳者名稱
+    # 上傳者名稱
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
         uploader = profile.display_name or "LINE使用者"
     except Exception:
         uploader = "LINE使用者"
 
-    # 建立索引：紀錄ID → row
+    # 索引：紀錄ID → row
     all_vals = ws.get_all_values()
     rows = all_vals[1:]
     id2row = {}
-    for ridx, r in enumerate(rows, start=2):  # 2 = 含表頭
+    for ridx, r in enumerate(rows, start=2):
         try:
             rid = r[idxA-1].strip()
             if re.fullmatch(r"R\d{4}", rid):
@@ -680,8 +627,6 @@ def _write_ocr_results(pairs, event):
         row_i = id2row.get(rid)
         if not row_i:
             continue
-        # 寫入：K單號、J出貨日=今日、L經手人、M狀態=已託運
-        # 單號以文字型態存（避免長數字轉科學記號）
         ws.update_cell(row_i, idxK, f"'{no}")
         ws.update_cell(row_i, idxJ, today_str())
         ws.update_cell(row_i, idxL, uploader)
@@ -708,32 +653,20 @@ def callback():
         abort(400)
     return "OK"
 
-# =========================
 # 文字訊息處理
-# =========================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = (event.message.text or "").strip()
-
-    # 指令：#寄書 / #寄書需求
     if text.startswith("#寄書需求") or text.startswith("#寄書"):
-        _handle_new_order(event, text)
-        return
-
-    # 指令：#查詢寄書 / #查寄書
+        _handle_new_order(event, text); return
     if text.startswith("#查詢寄書") or text.startswith("#查寄書"):
-        _handle_query(event, text)
-        return
-
-    # 其他文字
+        _handle_query(event, text); return
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text="請使用：\n#寄書（建立寄書任務）\n#查寄書（姓名或電話）")
     )
 
-# =========================
 # 圖片訊息處理（OCR）
-# =========================
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     try:
@@ -741,8 +674,7 @@ def handle_image_message(event):
         img_bytes = _download_line_image_bytes(event.message.id)
         if not _vision_client:
             msg = "❌ OCR 處理時發生錯誤：Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON 已設定，且專案已啟用 Vision API）。"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-            return
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg)); return
 
         text = _ocr_text_from_bytes(img_bytes)
         if LOG_OCR_RAW:
@@ -750,7 +682,6 @@ def handle_image_message(event):
 
         pairs, leftovers = _pair_ids_with_numbers(text)
         resp = _write_ocr_results(pairs, event)
-
         if leftovers:
             resp += "\n\n❗以下項目需人工檢核：\n" + "\n".join(leftovers[:10])
 
@@ -761,9 +692,7 @@ def handle_image_message(event):
         msg = f"❌ OCR 錯誤（代碼 {code}）：{e}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
-# ============================================
 # 健康檢查
-# ============================================
 @app.route("/", methods=["GET"])
 def index():
     try:
@@ -772,9 +701,7 @@ def index():
     except Exception as e:
         return f"OK / (Sheets not loaded) {e}"
 
-# ============================================
 # 本地執行（Railway 用 gunicorn 啟動）
-# ============================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
