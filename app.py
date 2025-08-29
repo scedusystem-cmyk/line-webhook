@@ -1,9 +1,9 @@
 # app.py
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版
+# 《寄書＋進銷存 自動化機器人》— 完整版（方案A：插入第2列不繼承格式）
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
 # 特點：
-# - 建檔「上新下舊」（插入第2列）
+# - 建檔「上新下舊」（InsertDimension inheritFromBefore=False，避免複製刪除線）
 # - 寄送方式：只偵測便利商店；若未偵測且有地址 → 自動設為「便利帶」
 # - 查詢回覆樣式（待處理/已託運）
 # - OCR 寫回（單號/出貨日/經手人/狀態）
@@ -350,6 +350,31 @@ def _build_insert_row(ws, data, who_display_name):
 
     return row, {"rid": rid}
 
+# ★★ 方案A的核心：插入第2列「不繼承格式」再寫值
+def _insert_row_values_no_inherit(ws, row_values, index=2):
+    """在指定 index 插入一列且不繼承上一列的格式，然後把 row_values 寫入。"""
+    # 1) 插入列（不繼承格式）
+    ss.batch_update({
+        "requests": [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": index - 1,  # 0-based, 含
+                    "endIndex": index        # 不含
+                },
+                "inheritFromBefore": False
+            }
+        }]
+    })
+    # 2) 寫值到新列
+    header_len = len(ws.row_values(1)) or 13
+    last_col = max(header_len, len(row_values))
+    if len(row_values) < last_col:
+        row_values = row_values + [""] * (last_col - len(row_values))
+    rng = f"A{index}:{col_to_letter(last_col)}{index}"
+    ws.update(rng, [row_values], value_input_option="USER_ENTERED")
+
 # ============================================
 # 解析＋指令處理（建立寄書）
 # ============================================
@@ -454,7 +479,9 @@ def _handle_new_order(event, text):
 
     ws = _ws(MAIN_SHEET_NAME)
     row, meta = _build_insert_row(ws, parsed, display_name)
-    ws.insert_row(row, index=2, value_input_option="USER_ENTERED")  # 上新下舊
+
+    # ★ 使用方案A：插入第2列不繼承格式，再寫值
+    _insert_row_values_no_inherit(ws, row, index=2)
 
     resp = (
         "✅ 已成功建檔\n"
@@ -476,7 +503,6 @@ def _handle_query(event, text):
     ws = _ws(MAIN_SHEET_NAME)
     h = _get_header_map(ws)
     idxB = _col_idx(h, "建單日期", 2)
-    idxC = _col_idx(h, "建單人", 3)
     idxD = _col_idx(h, "學員姓名", 4)
     idxE = _col_idx(h, "學員電話", 5)
     idxG = _col_idx(h, "書籍名稱", 7)
@@ -645,29 +671,24 @@ def _find_latest_order(ws, name, phone):
     return candidates[0]
 
 def _format_row_strikethrough(ws, row_i):
-    """整行套刪除線樣式"""
-    header_len = len(ws.row_values(1))
+    """整行套刪除線樣式（使用 batch_update → repeatCell，可靠覆蓋整列）"""
+    header_len = len(ws.row_values(1)) or 13
     last_col = max(header_len, 13)
-    rng = f"A{row_i}:{col_to_letter(last_col)}{row_i}"
-    try:
-        ws.format(rng, {"textFormat": {"strikethrough": True}})
-    except Exception:
-        # Fallback
-        ss.batch_update({
-            "requests": [{
-                "repeatCell": {
-                    "range": {
-                        "sheetId": ws.id,
-                        "startRowIndex": row_i-1,
-                        "endRowIndex": row_i,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": last_col
-                    },
-                    "cell": {"userEnteredFormat": {"textFormat": {"strikethrough": True}}},
-                    "fields": "userEnteredFormat.textFormat.strikethrough"
-                }
-            }]
-        })
+    ss.batch_update({
+        "requests": [{
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row_i - 1,
+                    "endRowIndex": row_i,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": last_col
+                },
+                "cell": {"userEnteredFormat": {"textFormat": {"strikethrough": True}}},
+                "fields": "userEnteredFormat.textFormat.strikethrough"
+            }
+        }]
+    })
 
 def _handle_cancel_request(event, text):
     # 取操作者顯示名稱
