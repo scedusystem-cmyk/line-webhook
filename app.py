@@ -192,10 +192,10 @@ def _load_zipref():
 def lookup_zip(address: str):
     if not address:
         return None
-    pairs = _load_zipref()
+    pairs = _load_zipref()  # [("中正區","100"),("大同區","103"), ...]
     a = address.strip()
     for prefix, z in pairs:
-        if a.startswith(prefix):
+        if prefix in a:   # 改成「包含」判斷
             return z
     return None
 
