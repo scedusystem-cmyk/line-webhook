@@ -1,6 +1,6 @@
 # app.py
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版（移除刪除線；地址自動補郵遞區號）
+# 《寄書＋進銷存 自動化機器人》— 完整版（加入白名單；移除刪除線；地址自動補郵遞區號）
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
 # 特點：
 # - 建檔「上新下舊」（InsertDimension inheritFromBefore=False，避免格式連帶）
@@ -9,10 +9,11 @@
 # - 查詢回覆樣式（待處理/已託運；預設不顯示已刪除）
 # - OCR 寫回（單號/出貨日/經手人/狀態）
 # - 取消寄書（軟刪除）：#取消寄書（權限=建單人同名、Y/N 確認；無刪除線，只寫備註＋狀態）
+# - 白名單：單純 user_id 驗證；自動記錄候選名單；「我的ID」指令永遠可用
 # ============================================
 
 from flask import Flask, request, abort
-import os, re, io, json, difflib, logging
+import os, re, io, json, difflib, logging, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -48,6 +49,15 @@ BOOK_MASTER_SHEET_NAME = os.getenv("BOOK_MASTER_SHEET_NAME", "書目主檔")
 ZIPREF_SHEET_NAME = os.getenv("ZIPREF_SHEET_NAME", "郵遞區號參照表")
 STOCK_IN_SHEET_NAME = os.getenv("STOCK_IN_SHEET_NAME", "入庫明細")
 HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "歷史紀錄")
+
+# === 白名單設定 ===
+WHITELIST_SHEET_NAME = os.getenv("WHITELIST_SHEET_NAME", "白名單")
+CANDIDATE_SHEET_NAME = os.getenv("CANDIDATE_SHEET_NAME", "候選名單")
+# WHITELIST_MODE: off | log | enforce
+WHITELIST_MODE = os.getenv("WHITELIST_MODE", "off").strip().lower()
+ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
+_WHITELIST_CACHE = {"ts": 0.0, "set": set()}
+_WHITELIST_TTL = 300  # 秒
 
 FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.6"))
 QUERY_DAYS = int(os.getenv("QUERY_DAYS", "30"))
@@ -91,6 +101,16 @@ ss = gc.open_by_key(SHEET_ID)
 def _ws(name: str):
     return ss.worksheet(name)
 
+def _get_or_create_ws(name: str, headers: list[str]):
+    """若工作表不存在則建立，並補上表頭"""
+    try:
+        ws = ss.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=name, rows=200, cols=max(10, len(headers)))
+        if headers:
+            ws.update(f"A1:{chr(64+len(headers))}1", [headers])
+    return ws
+
 def _get_header_map(ws):
     header = ws.row_values(1)
     hmap = {}
@@ -102,6 +122,89 @@ def _get_header_map(ws):
 
 def _col_idx(hmap, key, default_idx):
     return hmap.get(key, default_idx)
+
+# ============================================
+# 功能 W：白名單（單純 user_id 驗證 + 候選名單自動記錄）
+# ============================================
+def _truthy(v) -> bool:
+    s = str(v).strip().lower()
+    return s in ("1","true","yes","y","t","啟用","是","enabled","on")
+
+def _load_whitelist(force: bool = False) -> set[str]:
+    """回傳 enabled 的 user_id set，快取 5 分鐘"""
+    now = time.time()
+    if (not force) and _WHITELIST_CACHE["set"] and (now - _WHITELIST_CACHE["ts"] < _WHITELIST_TTL):
+        return _WHITELIST_CACHE["set"]
+    ws = _get_or_create_ws(WHITELIST_SHEET_NAME, ["user_id","name","enabled"])
+    rows = ws.get_all_records()
+    enabled = {str(r.get("user_id","")).strip() for r in rows if str(r.get("user_id","")).strip() and _truthy(r.get("enabled", "1"))}
+    _WHITELIST_CACHE["set"] = enabled
+    _WHITELIST_CACHE["ts"] = now
+    return enabled
+
+def _log_candidate(user_id: str, name: str):
+    """自動記錄到候選名單（若已存在只更新 last_seen）"""
+    try:
+        ws = _get_or_create_ws(CANDIDATE_SHEET_NAME, ["user_id","name","first_seen","last_seen"])
+        all_vals = ws.get_all_values()
+        h = _get_header_map(ws)
+        idx_uid = _col_idx(h, "user_id", 1)
+        idx_name = _col_idx(h, "name", 2)
+        idx_first = _col_idx(h, "first_seen", 3)
+        idx_last = _col_idx(h, "last_seen", 4)
+
+        # 建索引
+        exists_row = None
+        for i, r in enumerate(all_vals[1:], start=2):
+            if (len(r) >= idx_uid) and r[idx_uid-1] == user_id:
+                exists_row = i
+                break
+
+        now_s = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+        if exists_row:
+            if name:
+                try:
+                    ws.update_cell(exists_row, idx_name, name)
+                except Exception:
+                    pass
+            ws.update_cell(exists_row, idx_last, now_s)
+        else:
+            ws.append_row([user_id, name, now_s, now_s], value_input_option="USER_ENTERED")
+    except Exception as e:
+        app.logger.info(f"[CANDIDATE] log failed: {e}")
+
+def _ensure_authorized(event, scope: str = "*") -> bool:
+    """根據 WHITELIST_MODE 判斷是否放行；未授權時回覆說明並附使用者ID"""
+    try:
+        uid = getattr(event.source, "user_id", "")
+        profile = line_bot_api.get_profile(uid)
+        display_name = profile.display_name or "LINE使用者"
+    except Exception:
+        uid = getattr(event.source, "user_id", "")
+        display_name = "LINE使用者"
+
+    # 候選名單永遠記錄
+    if uid:
+        _log_candidate(uid, display_name)
+
+    if uid in ADMIN_USER_IDS:
+        return True
+    if WHITELIST_MODE in ("off", "log"):
+        # off: 完全不限制；log: 允許但只紀錄候選
+        return True
+
+    # enforce 模式
+    allowed = _load_whitelist()
+    if uid in allowed:
+        return True
+
+    # 未授權 → 提示＋顯示ID，避免你還要「去問ID」
+    msg = f"❌ 尚未授權使用。\n請將此 ID 提供給管理員開通：\n{uid}\n\n（提示：傳「我的ID」也能取得這串 ID）"
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    except Exception:
+        pass
+    return False
 
 # ============================================
 # 工具與格式化
@@ -195,7 +298,7 @@ def lookup_zip(address: str):
     pairs = _load_zipref()  # [("中正區","100"),("大同區","103"), ...]
     a = address.strip()
     for prefix, z in pairs:
-        if prefix in a:   # 改成「包含」判斷
+        if prefix in a:   # 「包含」判斷
             return z
     return None
 
@@ -846,8 +949,29 @@ def callback():
 def handle_text_message(event):
     text = (event.message.text or "").strip()
 
+    # 🔓 特例：任何人都可用「我的ID」取得自己的 user_id（方便申請授權）
+    if text == "我的ID":
+        uid = getattr(event.source, "user_id", "")
+        try:
+            profile = line_bot_api.get_profile(uid)
+            name = profile.display_name or "LINE使用者"
+        except Exception:
+            name = "LINE使用者"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"你的 ID：\n{uid}\n顯示名稱：{name}\n\n請提供給管理員加入白名單。")
+        )
+        # 同步記錄候選名單
+        if uid:
+            _log_candidate(uid, name)
+        return
+
     # 先處理待確認的 Y/N
     if _handle_pending_answer(event, text):
+        return
+
+    # ⛔ 白名單：未授權直接擋（off/log/enforce）
+    if not _ensure_authorized(event, scope="text"):
         return
 
     if text.startswith("#寄書需求") or text.startswith("#寄書"):
@@ -861,12 +985,16 @@ def handle_text_message(event):
 
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text="請使用：\n#寄書（建立寄書任務）\n#查寄書（姓名或電話）\n#取消寄書（姓名或電話）")
+        TextSendMessage(text="請使用：\n#寄書（建立寄書任務）\n#查寄書（姓名或電話）\n#取消寄書（姓名或電話）\n或傳「我的ID」取得你的ID以便開通白名單。")
     )
 
 # 圖片訊息處理（OCR）
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
+    # ⛔ 白名單：未授權直接擋（off/log/enforce）
+    if not _ensure_authorized(event, scope="ocr"):
+        return
+
     try:
         app.logger.info(f"[IMG] 收到圖片 user_id={getattr(event.source,'user_id','unknown')} msg_id={event.message.id}")
         img_bytes = _download_line_image_bytes(event.message.id)
