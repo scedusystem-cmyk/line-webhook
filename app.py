@@ -1,13 +1,14 @@
 # app.py
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版（方案A：插入第2列不繼承格式）
+# 《寄書＋進銷存 自動化機器人》— 完整版（移除刪除線；地址自動補郵遞區號）
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
 # 特點：
-# - 建檔「上新下舊」（InsertDimension inheritFromBefore=False，避免複製刪除線）
+# - 建檔「上新下舊」（InsertDimension inheritFromBefore=False，避免格式連帶）
 # - 寄送方式：只偵測便利商店；若未偵測且有地址 → 自動設為「便利帶」
-# - 查詢回覆樣式（待處理/已託運）
+# - 新增寄書：若讀到地址，**一律嘗試查郵遞區號並前置到 F 欄**
+# - 查詢回覆樣式（待處理/已託運；預設不顯示已刪除）
 # - OCR 寫回（單號/出貨日/經手人/狀態）
-# - 取消寄書（軟刪除）：#取消寄書（權限=建單人同名、Y/N 確認、整列套刪除線）
+# - 取消寄書（軟刪除）：#取消寄書（權限=建單人同名、Y/N 確認；無刪除線，只寫備註＋狀態）
 # ============================================
 
 from flask import Flask, request, abort
@@ -333,8 +334,8 @@ def _build_insert_row(ws, data, who_display_name):
     row[idxE-1] = f"'{phone}" if phone else ""
     address = data.get("address","")
 
-    # 郵遞區號：僅在（未指定/空/宅配）才補；「便利帶」不補
-    if WRITE_ZIP_TO_ADDRESS and (data.get("delivery") in (None, "", "宅配")) and address:
+    # ✅ 一律嘗試補郵遞區號（若能對上且目前沒3碼開頭）
+    if WRITE_ZIP_TO_ADDRESS and address:
         z = lookup_zip(address)
         if z and not re.match(r"^\d{3}", address):
             address = f"{z}{address}"
@@ -350,24 +351,21 @@ def _build_insert_row(ws, data, who_display_name):
 
     return row, {"rid": rid}
 
-# ★★ 方案A的核心：插入第2列「不繼承格式」再寫值
+# ★ 插入第2列不繼承格式
 def _insert_row_values_no_inherit(ws, row_values, index=2):
-    """在指定 index 插入一列且不繼承上一列的格式，然後把 row_values 寫入。"""
-    # 1) 插入列（不繼承格式）
     ss.batch_update({
         "requests": [{
             "insertDimension": {
                 "range": {
                     "sheetId": ws.id,
                     "dimension": "ROWS",
-                    "startIndex": index - 1,  # 0-based, 含
-                    "endIndex": index        # 不含
+                    "startIndex": index - 1,
+                    "endIndex": index
                 },
                 "inheritFromBefore": False
             }
         }]
     })
-    # 2) 寫值到新列
     header_len = len(ws.row_values(1)) or 13
     last_col = max(header_len, len(row_values))
     if len(row_values) < last_col:
@@ -379,10 +377,6 @@ def _insert_row_values_no_inherit(ws, row_values, index=2):
 # 解析＋指令處理（建立寄書）
 # ============================================
 def _parse_new_order_text(raw_text: str):
-    """
-    解析 #寄書 / #寄書需求
-    必填：姓名、電話、書名；地址（若非便利商店寄送）
-    """
     data = parse_kv_lines(raw_text)
 
     # 1) 姓名
@@ -479,9 +473,7 @@ def _handle_new_order(event, text):
 
     ws = _ws(MAIN_SHEET_NAME)
     row, meta = _build_insert_row(ws, parsed, display_name)
-
-    # ★ 使用方案A：插入第2列不繼承格式，再寫值
-    _insert_row_values_no_inherit(ws, row, index=2)
+    _insert_row_values_no_inherit(ws, row, index=2)  # 上新下舊（不繼承格式）
 
     resp = (
         "✅ 已成功建檔\n"
@@ -572,7 +564,7 @@ def _handle_query(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 # ============================================
-# 取消寄書（軟刪除）
+# 取消寄書（軟刪除；無刪除線）
 # 指令：#取消寄書  [姓名/電話 可同時]
 # 權限：建單人（C欄）須等於操作者的 LINE 顯示名稱
 # 確認：顯示摘要，要求回覆 Y/N
@@ -580,46 +572,31 @@ def _handle_query(event, text):
 _PENDING = {}  # user_id -> pending dict
 
 def _extract_cancel_target(text: str):
-    """
-    從 '#取消寄書 ...' 取得姓名/電話。
-    支援：同一行或多行鍵值（學員姓名/學員電話）
-    """
     body = re.sub(r"^#取消寄書\s*", "", text.strip())
     name, phone = None, None
 
-    # 先從鍵值行找
     data = parse_kv_lines(body)
     for k in list(data.keys()):
         if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
-            name = "、".join(data.pop(k))
-            break
+            name = "、".join(data.pop(k)); break
     for k in list(data.keys()):
         if "電話" in k:
             for v in data.pop(k):
                 p = normalize_phone(v)
-                if p:
-                    phone = p
-                    break
+                if p: phone = p; break
             break
 
-    # 若仍沒有，再從同一行自由文字嘗試
     if not name or not phone:
         tokens = re.split(r"\s+", body)
         for t in tokens:
             tt = t.strip()
-            if not tt:
-                continue
+            if not tt: continue
             p = normalize_phone(tt)
-            if (not phone) and p:
-                phone = p
-                continue
-            if not name and not re.search(r"\d", tt):
-                name = tt
-
+            if (not phone) and p: phone = p; continue
+            if not name and not re.search(r"\d", tt): name = tt
     return (name, phone)
 
 def _find_latest_order(ws, name, phone):
-    """依姓名/電話（後9碼）在近 QUERY_DAYS 內找最新一筆；回傳 (row_index, row_values) 或 (None, None)"""
     h = _get_header_map(ws)
     idxA = _col_idx(h, "紀錄ID", 1)
     idxB = _col_idx(h, "建單日期", 2)
@@ -648,50 +625,23 @@ def _find_latest_order(ws, name, phone):
                     dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
                 except Exception:
                     dt = None
-            if dt and dt < since:
-                continue
+            if dt and dt < since: continue
 
             ok = True
-            if name and name not in (r[idxD-1] or ""):
-                ok = False
+            if name and name not in (r[idxD-1] or ""): ok = False
             if phone_suffix:
                 cand = re.sub(r"\D+","", r[idxE-1] or "")
                 if not (len(cand) >= PHONE_SUFFIX_MATCH and cand[-PHONE_SUFFIX_MATCH:] == phone_suffix):
                     ok = False
-            if ok:
-                candidates.append((ridx, r))
+            if ok: candidates.append((ridx, r))
         except Exception:
             continue
 
-    if not candidates:
-        return (None, None)
-
-    # 取建單日期新者；若同字串排序也可
+    if not candidates: return (None, None)
     candidates.sort(key=lambda x: x[1][idxB-1], reverse=True)
     return candidates[0]
 
-def _format_row_strikethrough(ws, row_i):
-    """整行套刪除線樣式（使用 batch_update → repeatCell，可靠覆蓋整列）"""
-    header_len = len(ws.row_values(1)) or 13
-    last_col = max(header_len, 13)
-    ss.batch_update({
-        "requests": [{
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": row_i - 1,
-                    "endRowIndex": row_i,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": last_col
-                },
-                "cell": {"userEnteredFormat": {"textFormat": {"strikethrough": True}}},
-                "fields": "userEnteredFormat.textFormat.strikethrough"
-            }
-        }]
-    })
-
 def _handle_cancel_request(event, text):
-    # 取操作者顯示名稱
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
         display_name = profile.display_name or "LINE使用者"
@@ -717,7 +667,6 @@ def _handle_cancel_request(event, text):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到紀錄"))
         return
 
-    # 權限：建單人=操作者名稱
     creator = (r[idxC-1] or "").strip() or "LINE使用者"
     if creator != display_name:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 你沒有刪除權限（請聯繫管理者）"))
@@ -727,18 +676,13 @@ def _handle_cancel_request(event, text):
     outd = (r[idxJ-1] or "").strip()
     shipno = (r[idxK-1] or "").strip()
     if status == "已託運":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 已託運，無法刪除"))
-        return
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 已託運，無法刪除")); return
     if status == "已刪除":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 已是已刪除狀態"))
-        return
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 已是已刪除狀態")); return
     if (shipno or outd) and status != "已託運":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 無法處理，請私訊客服。"))
-        return
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 無法處理，請私訊客服。")); return
 
-    # 提示確認（Y/N）
-    stu = r[idxD-1]
-    book = r[idxG-1]
+    stu = r[idxD-1]; book = r[idxG-1]
     _PENDING[event.source.user_id] = {
         "type": "cancel_order",
         "sheet": MAIN_SHEET_NAME,
@@ -755,24 +699,20 @@ def _handle_cancel_request(event, text):
 
 def _handle_pending_answer(event, text):
     pend = _PENDING.get(event.source.user_id)
-    if not pend:
-        return False  # 沒有待處理
+    if not pend: return False
     ans = text.strip().upper()
-    if ans not in ("Y","N"):
-        return False
+    if ans not in ("Y","N"): return False
     if ans == "N":
         _PENDING.pop(event.source.user_id, None)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已結束對話。"))
         return True
 
-    # Y：執行軟刪除
     ws = _ws(pend["sheet"])
     row_i = pend["row_i"]
     idxH = pend["idx"]["H"]
     idxL = pend["idx"]["L"]
     idxM = pend["idx"]["M"]
 
-    # 追加備註
     try:
         curr_h = ws.cell(row_i, idxH).value or ""
     except Exception:
@@ -783,9 +723,7 @@ def _handle_pending_answer(event, text):
     ws.update_cell(row_i, idxH, new_h)
     ws.update_cell(row_i, idxL, pend["operator"])
     ws.update_cell(row_i, idxM, "已刪除")
-    _format_row_strikethrough(ws, row_i)
 
-    # 成功訊息
     msg = f"✅ 寄書任務已刪除：{pend['stu']} 的 {pend['book']}"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
     _PENDING.pop(event.source.user_id, None)
@@ -855,7 +793,6 @@ def _write_ocr_results(pairs, event):
     idxL = _col_idx(h, "經手人", 12)
     idxM = _col_idx(h, "寄送狀態", 13)
 
-    # 上傳者名稱
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
         uploader = profile.display_name or "LINE使用者"
