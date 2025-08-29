@@ -3,6 +3,7 @@
 # 尚進《寄書＋進銷存》：
 # - OCR → 解析 → 回填寄書任務
 # - 查詢寄書進度 (#查寄書)
+# - 申請刪除 (#申請刪除)
 # ============================================
 
 from flask import Flask, request, abort
@@ -98,11 +99,14 @@ def callback():
 # =========================
 # 文字訊息處理
 # =========================
+_pending_delete = {}  # 暫存用戶待確認刪除的紀錄ID
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = event.message.text.strip()
+    user_id = getattr(event.source, "user_id", "")
 
-    # ✅ 新增：查詢寄書進度
+    # ✅ 查詢寄書進度
     if text.startswith("#查寄書"):
         query = text.replace("#查寄書", "").strip()
         if not query:
@@ -112,17 +116,31 @@ def handle_text_message(event):
             )
             return
         result = search_ship_status(query)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=result)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    # ✅ 申請刪除
+    if text.startswith("#申請刪除"):
+        query = text.replace("#申請刪除", "").strip()
+        if not query:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 請輸入學員姓名或電話號碼"))
+            return
+        result = request_delete(query, user_id)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        return
+
+    # ✅ 確認刪除 (Y/是)
+    if text in ["Y", "是"]:
+        if user_id in _pending_delete:
+            record_id = _pending_delete.pop(user_id)
+            result = confirm_delete(record_id, user_id)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 沒有待刪除的申請"))
         return
 
     # 保留原本 echo
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=f"已收到訊息：{text}")
-    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"已收到訊息：{text}"))
 
 # =========================
 # ✅ 查詢寄書進度（30 天內）
@@ -143,7 +161,6 @@ def search_ship_status(query: str) -> str:
             if not build_date_str:
                 continue
             try:
-                # ⚡ 只取日期前 10 碼，避免時間格式報錯
                 date_part = build_date_str[:10]
                 build_date = datetime.strptime(date_part, "%Y-%m-%d").date()
             except Exception:
@@ -153,8 +170,6 @@ def search_ship_status(query: str) -> str:
 
             name = str(row.get("學員姓名", "")).strip()
             phone_raw = str(row.get("學員電話", "")).strip()
-
-            # ⚡ 電話只取後 9 碼比對
             phone_tail9 = phone_raw[-9:] if len(phone_raw) >= 9 else phone_raw
             query_tail9 = query[-9:] if query.isdigit() else query
 
@@ -174,7 +189,6 @@ def search_ship_status(query: str) -> str:
             tracking = str(row.get("託運單號", "")).strip()
 
             corrected = False
-            # 🛡️ 防呆②：有單號但狀態不是已託運 → 自動更正
             if tracking and status != "已託運":
                 status = "已託運"
                 corrected = True
@@ -195,6 +209,69 @@ def search_ship_status(query: str) -> str:
         app.logger.exception(e)
         return f"❌ 查詢時發生錯誤：{e}"
 
+# =========================
+# ✅ 申請刪除
+# =========================
+def request_delete(query: str, user_id: str) -> str:
+    try:
+        gc = _build_gspread_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet(MAIN_SHEET_NAME)
+        rows = ws.get_all_records()
+        matched = None
+        row_index = None
+
+        for idx, row in enumerate(rows, start=2):  # 因為第1列是表頭
+            name = str(row.get("學員姓名", "")).strip()
+            phone = str(row.get("學員電話", "")).strip()
+            status = str(row.get("寄送狀態", "")).strip()
+            creator = str(row.get("LINE_USER_ID", "")).strip()
+
+            if (query in name or query in phone) and status == "待處理" and creator == user_id:
+                matched = row
+                row_index = idx
+                break
+
+        if not matched:
+            return "❌ 沒有符合條件的待處理紀錄（只能刪自己建立，且狀態為待處理）"
+
+        record_id = matched.get("紀錄ID", "")
+        book = matched.get("書籍名稱", "")
+        student = matched.get("學員姓名", "")
+
+        # 暫存這筆紀錄，等待確認
+        _pending_delete[user_id] = row_index
+        return f"⚠️ 找到紀錄 {record_id}\n學員：{student}\n書籍：{book}\n狀態：待處理\n\n請輸入 Y 或 是 確認刪除"
+
+    except Exception as e:
+        app.logger.exception(e)
+        return f"❌ 申請刪除時發生錯誤：{e}"
+
+# =========================
+# ✅ 確認刪除
+# =========================
+def confirm_delete(row_index: int, user_id: str) -> str:
+    try:
+        gc = _build_gspread_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet(MAIN_SHEET_NAME)
+        row = ws.row_values(row_index)
+
+        student = row[4] if len(row) > 4 else ""  # 學員姓名
+        book = row[7] if len(row) > 7 else ""    # 書籍名稱
+
+        # 更新寄送狀態 = 已刪除
+        ws.update_cell(row_index, 14, "已刪除")  # 第14欄是寄送狀態
+
+        # 加刪除線：把整列套用刪除線
+        fmt = gspread.format.CellFormat(textFormat={"strikethrough": True})
+        ws.format(f"A{row_index}:N{row_index}", fmt)
+
+        return f"✅ 學員：{student} ／ 書籍：{book} 已刪除"
+
+    except Exception as e:
+        app.logger.exception(e)
+        return f"❌ 確認刪除時發生錯誤：{e}"
 
 # =========================
 # 工具：下載 LINE 圖片位元組
@@ -224,9 +301,6 @@ def _ocr_text_from_bytes(image_bytes: bytes) -> str:
     except Exception as e:
         app.logger.exception(e)
         return ""
-
-# （以下 OCR 解析 + update_sheet_with_pairs + handle_image_message 都保持你的原始程式不變）
-# ...
 
 # =========================
 # 本地測試入口
