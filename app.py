@@ -1,10 +1,23 @@
 # app.py
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版（白名單／OCR門檻／入庫）
+# 《寄書＋進銷存 自動化機器人》— 完整版（白名單／只回覆指令／OCR門檻／入庫支援負數）
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
-# 指令只處理以下：#我的ID、#寄書、#查寄書、#取消寄書、#刪除寄書、
-#                 #刪除出書、#取消出書、#出書、#買書、#入庫
+#
+# 指令只處理以下：
+#   #我的ID、#寄書、#查寄書、#取消寄書、#刪除寄書、#刪除出書、#取消出書、#出書、#買書、#入庫
 # 其他文字／圖片：一律不處理、不回覆。
+#
+# 模組索引（完整 PY 原則）：
+# - 功能 A：白名單驗證 + 候選名單記錄
+# - 功能 B：寄書建立（#寄書，地址自動補3碼郵遞區號）
+# - 功能 C：查寄書（電話後碼模糊比對、預設排除已刪除）
+# - 功能 D：取消/刪除寄書（軟刪除，需建單人）
+# - 功能 E：出書 OCR 啟用（#出書 開啟10分鐘會話，未開啟不回覆圖片）
+# - 功能 F：OCR 解析 + 寫回（R#### ↔ 12碼單號、寄出日期、經手人、狀態）
+# - 功能 G：刪除/取消出書（撤銷已託運欄位，狀態回待處理）
+# - 功能 H：入庫（#買書/#入庫：書名辨識→OK確認→寫入；支援負數＝盤點調整）
+# - 功能 I：#我的ID（不受白名單限制）
+# - 功能 J：只回覆指定指令／其他一律不回覆
 # ============================================
 
 from flask import Flask, request, abort
@@ -45,7 +58,7 @@ ZIPREF_SHEET_NAME = os.getenv("ZIPREF_SHEET_NAME", "郵遞區號參照表")
 STOCK_IN_SHEET_NAME = os.getenv("STOCK_IN_SHEET_NAME", "入庫明細")
 HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "歷史紀錄")
 
-# === 白名單設定 ===
+# === 白名單設定（功能 A）===
 WHITELIST_SHEET_NAME = os.getenv("WHITELIST_SHEET_NAME", "白名單")
 CANDIDATE_SHEET_NAME = os.getenv("CANDIDATE_SHEET_NAME", "候選名單")
 # WHITELIST_MODE: off | log | enforce
@@ -120,7 +133,7 @@ def _col_idx(hmap, key, default_idx):
     return hmap.get(key, default_idx)
 
 # ============================================
-# 功能 W：白名單（user_id 驗證 + 候選名單記錄）
+# 功能 A：白名單（user_id 驗證 + 候選名單記錄）
 # ============================================
 def _truthy(v) -> bool:
     s = str(v).strip().lower()
@@ -191,7 +204,7 @@ def _ensure_authorized(event, scope: str = "*") -> bool:
     if uid in allowed:
         return True
 
-    # 未授權 → 提示＋顯示ID（但只對「文字指令」提示；圖片一律不回覆）
+    # 未授權 → 文字才提示；圖片不回覆
     if scope == "text":
         msg = f"❌ 尚未授權使用。\n請將此 ID 提供給管理員開通：\n{uid}\n\n（提示：傳「#我的ID」也能取得這串 ID）"
         try:
@@ -297,7 +310,7 @@ def lookup_zip(address: str):
     return None
 
 # ============================================
-# 書名比對
+# 書名比對（共用）
 # ============================================
 def load_book_master():
     ws = _ws(BOOK_MASTER_SHEET_NAME)
@@ -474,7 +487,7 @@ def _insert_row_values_no_inherit(ws, row_values, index=2):
     ws.update(rng, [row_values], value_input_option="USER_ENTERED")
 
 # ============================================
-# 解析＋指令處理（建立寄書）
+# 功能 B：解析＋建立寄書（#寄書）
 # ============================================
 def _parse_new_order_text(raw_text: str):
     data = parse_kv_lines(raw_text)
@@ -500,7 +513,7 @@ def _parse_new_order_text(raw_text: str):
     # 3) 地址
     address = None
     for k in list(data.keys()):
-        if any(x in k for kx in ["寄送地址","地址","收件地址","配送地址"] for x in [kx]):
+        if any(x in k for x in ["寄送地址","地址","收件地址","配送地址"]):
             address = " ".join(data.pop(k))
             address = address.replace(" ", "")
             break
@@ -587,7 +600,7 @@ def _handle_new_order(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
 
 # ============================================
-# 查詢寄書（預設不顯示「已刪除」）
+# 功能 C：查詢寄書（預設不顯示「已刪除」）
 # ============================================
 def _handle_query(event, text):
     q = re.sub(r"^#(查詢寄書|查寄書)\s*", "", text.strip())
@@ -664,7 +677,7 @@ def _handle_query(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 # ============================================
-# 取消寄書（軟刪除；無刪除線）
+# 功能 D：取消寄書（軟刪除；無刪除線）
 # 指令：#取消寄書 / #刪除寄書  +（姓名/電話）
 # 權限：建單人（C欄）須等於操作者的 LINE 顯示名稱
 # 確認：回覆 Y/N
@@ -799,7 +812,7 @@ def _handle_cancel_request(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=prompt))
 
 # ============================================
-# 刪除／取消「出書」（撤銷已託運欄位）
+# 功能 G：刪除／取消「出書」（撤銷已託運欄位）
 # 指令：#刪除出書 / #取消出書 +（姓名/電話）
 # 動作：清空 寄出日期/託運單號/經手人，狀態改為「待處理」，備註附上時間戳
 # ============================================
@@ -902,7 +915,7 @@ def _handle_delete_ship(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 已撤銷最近一筆出書：欄位已清空並恢復為待處理"))
 
 # ============================================
-# OCR（必須先 #出書 才啟用）
+# 功能 E：出書 OCR 啟用（#出書 開啟會話）
 # ============================================
 def _start_ocr_session(user_id: str):
     _OCR_SESSION[user_id] = {
@@ -922,7 +935,7 @@ def _clear_ocr_session(user_id: str):
     _OCR_SESSION.pop(user_id, None)
 
 # ============================================
-# 圖片（OCR）處理：寫回單號/出貨日/經手人/狀態
+# 功能 F：OCR 解析 + 寫回託運單資訊
 # ============================================
 def _download_line_image_bytes(message_id: str) -> bytes:
     content = line_bot_api.get_message_content(message_id)
@@ -1020,8 +1033,7 @@ def _write_ocr_results(pairs, event):
     return "✅ 已更新：{} 筆\n{}".format(len(updated), "\n".join(lines))
 
 # ============================================
-# 入庫（#買書 / #入庫）
-# 解析「書名＋數量」文字 → 書名對應主檔 → 回覆清單請 OK/YES/Y 確認 → 寫入《入庫明細》
+# 功能 H：入庫（#買書 / #入庫；支援負數＝盤點調整）
 # 《入庫明細》表頭：日期/經手人/書籍名稱/數量/來源/備註
 # ============================================
 def _ensure_stockin_sheet():
@@ -1029,19 +1041,20 @@ def _ensure_stockin_sheet():
 
 def _parse_stockin_text(body: str):
     """
-    行為：逐行解析。每行自動抓最後一個整數作為數量（找不到則預設 1）。
+    逐行解析。每行抓最後一個整數(可含 +/-)作為數量；找不到則預設 1。
     書名：去除數量後送 resolve_book_name。
     回傳：items=[{"name":書名,"qty":數量}], errors=[str], ambiguous=[(raw,[候選])]
     """
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     items, errors, ambiguous = [], [], []
     for ln in lines:
-        # 擷取數量（優先 *x / x / 2本 / 數量：2）
-        m = re.search(r"(?:x|×|\*)\s*(\d+)$", ln, re.I)
+        # 支援 +/-：x -3 / × -3 / * -3 / 結尾 -3 / 數量：-3
+        m = re.search(r"(?:x|×|\*)\s*([+-]?\d+)$", ln, re.I)
         if not m:
-            m = re.search(r"(\d+)\s*(本|套|冊)?$", ln)
+            m = re.search(r"([+-]?\d+)\s*(本|套|冊)?$", ln)
         if not m:
-            m = re.search(r"數量[:：]\s*(\d+)", ln)
+            m = re.search(r"數量[:：]\s*([+-]?\d+)", ln)
+
         qty = int(m.group(1)) if m else 1
 
         # 去掉尾端數量片段
@@ -1093,6 +1106,8 @@ def _handle_stockin(event, text):
         merged[it["name"]] = merged.get(it["name"], 0) + int(it["qty"])
     items = [{"name": k, "qty": v} for k, v in merged.items()]
 
+    has_negative = any(it["qty"] < 0 for it in items)
+
     # 存入 pending 等確認
     _PENDING[event.source.user_id] = {
         "type": "stock_in_confirm",
@@ -1100,18 +1115,21 @@ def _handle_stockin(event, text):
         "items": items
     }
     lines = [f"• {it['name']} × {it['qty']}" for it in items]
-    msg = "請確認入庫項目：\n" + "\n".join(lines) + "\n\n回覆「OK / YES / Y」確認；或回覆「N」取消。"
+    suffix = "\n\n※ 含負數（自動標示來源：盤點調整）" if has_negative else ""
+    msg = "請確認入庫項目：\n" + "\n".join(lines) + suffix + "\n\n回覆「OK / YES / Y」確認；或回覆「N」取消。"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 def _write_stockin_rows(operator: str, items: list[dict]):
     ws = _ensure_stockin_sheet()
     rows = []
     for it in items:
-        rows.append([today_str(), operator, it["name"], it["qty"], "購買", ""])
+        qty = int(it["qty"])
+        source = "購買" if qty >= 0 else "盤點調整"
+        rows.append([today_str(), operator, it["name"], qty, source, ""])
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 # ============================================
-# 共用：處理待確認回答（Y/N/YES/OK）
+# 功能 I＋共用：處理待確認回答（Y/N/YES/OK）
 # ============================================
 def _handle_pending_answer(event, text):
     pend = _PENDING.get(event.source.user_id)
@@ -1171,12 +1189,12 @@ def callback():
         abort(400)
     return "OK"
 
-# 文字訊息處理（只處理指定指令）
+# 文字訊息處理（功能 J：只處理指定指令）
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     text = (event.message.text or "").strip()
 
-    # #我的ID：不受白名單限制
+    # 功能 I：#我的ID（不受白名單限制）
     if text.startswith("#我的ID"):
         uid = getattr(event.source, "user_id", "")
         try:
@@ -1195,7 +1213,7 @@ def handle_text_message(event):
             _log_candidate(uid, name)
         return
 
-    # 待確認流程（Y/N/YES/OK）
+    # 共用：待確認流程（Y/N/YES/OK）
     if _handle_pending_answer(event, text):
         return
 
@@ -1217,7 +1235,7 @@ def handle_text_message(event):
         _handle_delete_ship(event, text); return
 
     if text.startswith("#出書"):
-        # 開啟 OCR 視窗，回覆提示
+        # 開啟 OCR 視窗
         _start_ocr_session(getattr(event.source, "user_id", ""))
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"已啟用出書OCR（{OCR_SESSION_TTL_MIN} 分鐘）。請上傳出貨單照片。"))
         return
@@ -1225,10 +1243,10 @@ def handle_text_message(event):
     if text.startswith("#買書") or text.startswith("#入庫"):
         _handle_stockin(event, text); return
 
-    # 其他文字：不處理、不回覆（直接 return）
+    # 其他文字：不處理、不回覆
     return
 
-# 圖片訊息處理（僅在 #出書 後 N 分鐘內才啟用）
+# 圖片訊息處理（功能 E：僅在 #出書 後 N 分鐘內才啟用）
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     # 白名單：未授權直接擋（圖片不回覆）
@@ -1269,7 +1287,7 @@ def handle_image_message(event):
         except Exception:
             pass
     finally:
-        # 單次處理後關閉會話，避免誤觸；如需多張，可再輸入 #出書
+        # 單次處理後關閉會話；如需多張，再輸入 #出書
         _clear_ocr_session(uid)
 
 # 健康檢查
