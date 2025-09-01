@@ -1,6 +1,6 @@
 # app.py
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版（白名單／只回覆指令／OCR門檻／入庫支援負數／多書展開）
+# 《寄書＋進銷存 自動化機器人》— 完整版（白名單／只回覆指令／OCR門檻／入庫支援負數／多書展開／取消寄書修補）
 # 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
 #
 # 指令只處理以下：
@@ -11,7 +11,7 @@
 # - 功能 A：白名單驗證 + 候選名單記錄
 # - 功能 B：寄書建立（#寄書；地址自動補3碼郵遞區號；★★多本書同ID展開多列）
 # - 功能 C：查寄書（電話後碼模糊比對；★★同一ID合併顯示多本）
-# - 功能 D：取消/刪除寄書（★★同一ID全部刪除；需建單人）
+# - 功能 D：取消/刪除寄書（★★同一ID全部刪除；需建單人；※排序與已刪除修補）
 # - 功能 E：出書 OCR 啟用（#出書 開啟10分鐘會話，未開啟不回覆圖片）
 # - 功能 F：OCR 解析 + 寫回（R#### ↔ 12碼單號、寄出日期、經手人、狀態）
 # - 功能 G：刪除/取消出書（撤銷已託運欄位，狀態回待處理）
@@ -738,7 +738,7 @@ def _handle_query(event, text):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 # ============================================
-# 功能 D：取消寄書（★★同一ID全部刪除；無刪除線）
+# 功能 D：取消寄書（★★同一ID全部刪除；無刪除線；已刪除排除＋正確排序 修補）
 # 指令：#取消寄書 / #刪除寄書  +（姓名/電話）
 # 權限：建單人（C欄）須等於操作者的 LINE 顯示名稱
 # 確認：回覆 Y/N
@@ -771,6 +771,7 @@ def _extract_cancel_target(text: str):
             if not name and not re.search(r"\d", tt): name = tt
     return (name, phone)
 
+# 🔧 修補版：排除「已刪除」，用可解析的建單時間做排序（取最近一筆）
 def _find_latest_order(ws, name, phone):
     h = _get_header_map(ws)
     idxA = _col_idx(h, "紀錄ID", 1)
@@ -793,6 +794,11 @@ def _find_latest_order(ws, name, phone):
     candidates = []
     for ridx, r in enumerate(rows, start=2):
         try:
+            # 1) 排除「已刪除」
+            if (r[idxM-1] or "").strip() == "已刪除":
+                continue
+
+            # 2) 解析建單日期，超過查詢窗範圍則跳過
             dt_str = (r[idxB-1] or "").strip()
             dt = None
             if dt_str:
@@ -800,21 +806,31 @@ def _find_latest_order(ws, name, phone):
                     dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
                 except Exception:
                     dt = None
-            if dt and dt < since: continue
+            if dt and dt < since:
+                continue
 
+            # 3) 條件比對（姓名包含；電話後 N 碼）
             ok = True
-            if name and name not in (r[idxD-1] or ""): ok = False
+            if name and name not in (r[idxD-1] or ""):
+                ok = False
             if phone_suffix:
                 cand = re.sub(r"\D+","", r[idxE-1] or "")
                 if not (len(cand) >= PHONE_SUFFIX_MATCH and cand[-PHONE_SUFFIX_MATCH:] == phone_suffix):
                     ok = False
-            if ok: candidates.append((ridx, r))
+
+            if ok:
+                # 用「可比較的時間」當排序 key；若無法解析時間，用 datetime.min 墊底
+                key_dt = dt or datetime.min.replace(tzinfo=TZ)
+                candidates.append((key_dt, ridx, r))
         except Exception:
             continue
 
-    if not candidates: return (None, None)
-    candidates.sort(key=lambda x: x[1][idxB-1], reverse=True)
-    return candidates[0]
+    if not candidates:
+        return (None, None)
+    # 取建單時間最新的一筆
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, row_i, row = candidates[0]
+    return row_i, row
 
 def _collect_rows_by_rid(ws, rid: str):
     """回傳該 RID 的所有 (row_index, row_values)"""
@@ -1084,19 +1100,19 @@ def _write_ocr_results(pairs, event):
 
     all_vals = ws.get_all_values()
     rows = all_vals[1:]
-    id2row = {}
+    id2rows = {}
     for ridx, r in enumerate(rows, start=2):
         try:
             rid = (r[idxA-1] or "").strip()
             if re.fullmatch(r"R\d{4}", rid):
                 # ★★ 多列同一RID → 覆蓋所有列的出貨資訊（確保一致）
-                id2row.setdefault(rid, []).append(ridx)
+                id2rows.setdefault(rid, []).append(ridx)
         except Exception:
             continue
 
     updated = []
     for rid, no in pairs:
-        row_is = id2row.get(rid, [])
+        row_is = id2rows.get(rid, [])
         if not row_is:
             continue
         for row_i in row_is:
