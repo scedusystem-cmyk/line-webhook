@@ -62,7 +62,7 @@ HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "歷史紀錄")
 WHITELIST_SHEET_NAME = os.getenv("WHITELIST_SHEET_NAME", "白名單")
 CANDIDATE_SHEET_NAME = os.getenv("CANDIDATE_SHEET_NAME", "候選名單")
 # WHITELIST_MODE: off | log | enforce
-WHITELIST_MODE = os.getenv("WHITELIST_MODE", "off").strip().lower()
+WHITELIST_MODE = os.getenv("WHITELIST_MODE", "enforce").strip().lower()
 ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
 _WHITELIST_CACHE = {"ts": 0.0, "set": set()}
 _WHITELIST_TTL = 300  # 秒
