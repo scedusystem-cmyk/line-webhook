@@ -465,6 +465,66 @@ def resolve_book_name(user_input: str):
     return (None, "ambiguous", formal)
 
 
+# ========== 抽書名（整句最長優先＋數字相符） ==========
+def _extract_books_and_note_from_text(user_text: str):
+    """
+    從原始一句話中，找出『書名』(可多本) 與『備註』。
+    規則：
+      - 先把所有書目的別名攤平成清單，依「別名長度」由長到短檢查
+      - 若輸入中有數字，僅允許別名也含『相同數字』的書命中（避免 LG1 與 LG6 混淆）
+      - 命中後把該別名自原句移除，剩餘即為備註
+    回傳：(books: List[str], note: str)
+    """
+    raw = (user_text or "").strip()
+    norm = _normalize_for_match(raw)
+    if not norm:
+        return [], raw
+
+    # 取輸入中的數字（例如 "Lets Go 6 扣點" -> {"6"})
+    digits_in_input = set(re.findall(r"\d+", raw))
+
+    # 攤平所有書的所有別名，依長度由長到短
+    flat_aliases = []
+    for b in get_book_index():
+        for a in b["aliases"]:
+            flat_aliases.append((b["title"], a["raw"], a["norm"]))
+    flat_aliases.sort(key=lambda t: len(t[2] or ""), reverse=True)
+
+    matched_titles = []
+    matched_alias_raws = []
+    seen_titles = set()
+
+    for title, alias_raw, alias_norm in flat_aliases:
+        if title in seen_titles:
+            continue
+        if not alias_norm:
+            continue
+
+        # 若輸入有數字，要求別名也帶到相同數字（至少重疊一個）
+        if digits_in_input:
+            alias_digits = set(re.findall(r"\d+", alias_raw))
+            if not alias_digits.intersection(digits_in_input):
+                continue
+
+        # 只用「完整包含」判斷（alias_norm 必須整段在輸入 norm 中）
+        if alias_norm in norm:
+            matched_titles.append(title)
+            matched_alias_raws.append(alias_raw)
+            seen_titles.add(title)
+
+    # 從原句移除已命中的『可讀別名』，剩下即為備註
+    note = raw
+    for araw in sorted(matched_alias_raws, key=len, reverse=True):
+        note = re.sub(re.escape(araw), " ", note, flags=re.IGNORECASE)
+
+    # 移除電話與常見備註詞
+    note = re.sub(r"09\d{8}", " ", note)
+    for w in ["扣點","補寄","重寄","改寄","改地址","贈送","補書","換書","退回","急件","備註"]:
+        note = note.replace(w, " ")
+    note = re.sub(r"\s+", " ", note).strip()
+
+    return matched_titles, note
+# ======================================================
 
 
 # ============================================
@@ -587,65 +647,52 @@ def _insert_row_values_no_inherit(ws, row_values, index=2):
 
 # ============================================
 # 功能 X：原始資料 → #寄書 格式化（for #整理寄書）
-# 使用書目主檔判斷書名，其他詞視為備註
+# 使用整句最長優先比對 → 先抓書名，剩下變備註
 # ============================================
 def _parse_raw_to_order(text: str):
-    # 清理表格複製帶來的引號/空白
+    # 先把引號/全形空白處理乾淨
     text = (text or "").replace("\u3000", " ").strip()
     text = text.strip('"').strip("'")
     lines = [ln.strip().strip('"').strip("'") for ln in text.splitlines() if ln.strip()]
     if not lines:
         return None, ["❌ 沒有讀到任何內容"]
 
-    # 全文找電話（09開頭10碼）
+    # 電話（全文抓 09 開頭 10 碼）
     joined = " ".join(lines)
     m_phone = re.search(r"(09\d{8})", joined)
     phone = m_phone.group(1) if m_phone else None
     if phone:
         lines = [ln.replace(phone, "").strip() for ln in lines]
 
-    # 地址：第2行開始找
+    # 地址：從第2行開始找常見地名/路字眼
     addr_idx, address = None, None
     for i, ln in enumerate(lines[1:], start=1):
         if re.search(r"(市|縣).*(區|鄉|鎮|市)|路|街|段|巷|弄|號|樓", ln):
             address, addr_idx = ln.replace(" ", ""), i
             break
 
-    # 姓名：第一行最前段非數字字元
+    # 姓名：第一行前段的非數字連續字元
     first = lines[0]
     m_name = re.match(r"^[^\d\s]+", first)
     name = m_name.group(0) if m_name else None
     rest_first = first[len(name):].strip() if name else first
 
-    # 準備候選書名文字
+    # 準備一串「用來抽書名」的文字（不要再拆 token）
     other_lines = [ln for idx, ln in enumerate(lines[1:], start=1) if idx != addr_idx]
     candidate_text = " ".join([rest_first] + other_lines)
 
-    # 正規化分隔符
-    norm = candidate_text
-    norm = norm.translate(str.maketrans("（）／／、，．。・()", "      . .  ")).replace("/", " ")
-    norm = re.sub(r"[、，,／/．\.・()\[\]【】]+", " ", norm)
-    norm = re.sub(r"\s+", " ", norm).strip()
-    tokens = norm.split() if norm else []
-
-    # 書目主檔比對
-    books, notes = [], []
-    for tk in tokens:
-        bk, kind, extra = resolve_book_name(tk)
-        if bk:  # 書目主檔成功比對
-            if bk not in books:
-                books.append(bk)
-        else:
-            notes.append(tk)
+    # ★ 這裡用整句最長優先去抽書名，剩餘變備註
+    books, note = _extract_books_and_note_from_text(candidate_text)
 
     return {
         "name": name,
         "phone": phone,
         "address": address,
         "book_list": books,
-        "book_raw": "、".join(books) if books else None,
-        "biz_note": " / ".join(notes)
+        "book_raw": "、".join(books) if books else "",
+        "biz_note": note
     }, []
+
 
 # ============================================
 # 功能 B：解析＋建立寄書（#寄書）
