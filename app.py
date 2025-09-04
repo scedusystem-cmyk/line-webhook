@@ -409,7 +409,7 @@ def resolve_book_name(user_input: str):
     if not src_norm:
         return (None, "notfound", [])
 
-    # 🔑 擷取數字（例：N5 / Go6 → 5 or 6）
+    # 🔑 抓出輸入裡的數字
     digits = re.findall(r"\d+", user_input)
 
     books = get_book_index()
@@ -420,23 +420,24 @@ def resolve_book_name(user_input: str):
             if src_norm == alias["norm"]:
                 return (b["title"], "exact", None)
 
-    # 2) 若有數字 → 僅鎖定含該數字的書
+    # 2) 若輸入含數字 → 僅允許同樣數字的書進來
     narrowed_books = books
     if digits:
         narrowed_books = []
         for b in books:
-            if any(d in a["norm"] for a in b["aliases"] for d in digits):
+            aliases_norm = [a["norm"] for a in b["aliases"]]
+            if any(any(d == dd for dd in re.findall(r"\d+", a)) for d in digits for a in aliases_norm):
                 narrowed_books.append(b)
         if not narrowed_books:
             return (None, "notfound", [])
 
-    # 3) 完整包含（僅長度 >=4 的 alias 才算）
+    # 3) 完整包含（至少4碼）
     for b in narrowed_books:
         for alias in b["aliases"]:
             if len(alias["norm"]) >= 4 and alias["norm"] in src_norm:
                 return (b["title"], "contain", None)
 
-    # 4) Fuzzy 比對（忽略過短 alias）
+    # 4) Fuzzy 比對（過濾過短 alias）
     universe, reverse_map = [], {}
     for b in narrowed_books:
         for alias in b["aliases"]:
@@ -462,6 +463,7 @@ def resolve_book_name(user_input: str):
         return (formal[0], "fuzzy", None)
 
     return (None, "ambiguous", formal)
+
 
 
 
