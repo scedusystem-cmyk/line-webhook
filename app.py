@@ -535,6 +535,68 @@ def _insert_row_values_no_inherit(ws, row_values, index=2):
     ws.update(rng, [row_values], value_input_option="USER_ENTERED")
 
 # ============================================
+# 功能 X：原始資料 → #寄書 格式化（for #整理寄書）
+# 使用書目主檔判斷書名，其他詞視為備註
+# ============================================
+def _parse_raw_to_order(text: str):
+    # 清理表格複製帶來的引號/空白
+    text = (text or "").replace("\u3000", " ").strip()
+    text = text.strip('"').strip("'")
+    lines = [ln.strip().strip('"').strip("'") for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None, ["❌ 沒有讀到任何內容"]
+
+    # 全文找電話（09開頭10碼）
+    joined = " ".join(lines)
+    m_phone = re.search(r"(09\d{8})", joined)
+    phone = m_phone.group(1) if m_phone else None
+    if phone:
+        lines = [ln.replace(phone, "").strip() for ln in lines]
+
+    # 地址：第2行開始找
+    addr_idx, address = None, None
+    for i, ln in enumerate(lines[1:], start=1):
+        if re.search(r"(市|縣).*(區|鄉|鎮|市)|路|街|段|巷|弄|號|樓", ln):
+            address, addr_idx = ln.replace(" ", ""), i
+            break
+
+    # 姓名：第一行最前段非數字字元
+    first = lines[0]
+    m_name = re.match(r"^[^\d\s]+", first)
+    name = m_name.group(0) if m_name else None
+    rest_first = first[len(name):].strip() if name else first
+
+    # 準備候選書名文字
+    other_lines = [ln for idx, ln in enumerate(lines[1:], start=1) if idx != addr_idx]
+    candidate_text = " ".join([rest_first] + other_lines)
+
+    # 正規化分隔符
+    norm = candidate_text
+    norm = norm.translate(str.maketrans("（）／／、，．。・()", "      . .  ")).replace("/", " ")
+    norm = re.sub(r"[、，,／/．\.・()\[\]【】]+", " ", norm)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    tokens = norm.split() if norm else []
+
+    # 書目主檔比對
+    books, notes = [], []
+    for tk in tokens:
+        bk, kind, extra = resolve_book_name(tk)
+        if bk:  # 書目主檔成功比對
+            if bk not in books:
+                books.append(bk)
+        else:
+            notes.append(tk)
+
+    return {
+        "name": name,
+        "phone": phone,
+        "address": address,
+        "book_list": books,
+        "book_raw": "、".join(books) if books else None,
+        "biz_note": " / ".join(notes)
+    }, []
+
+# ============================================
 # 功能 B：解析＋建立寄書（#寄書）
 # （★★ 多本書支援：同一ID展開多列；寄送方式也檢查地址）
 # ============================================
@@ -613,6 +675,36 @@ def _parse_new_order_text(raw_text: str):
         "delivery": delivery,
         "raw_text": raw_text
     }, errors
+
+def _handle整理寄書(event, text):
+    body = re.sub(r"^#整理寄書\s*", "", text.strip())
+    parsed, errs = _parse_raw_to_order(body)
+    if errs:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(errs)))
+        return
+
+    books_line = parsed.get("book_raw") or ""
+    warn = "\n\n⚠️ 未辨識到書名，請補充或調整後再確認。" if not books_line else ""
+
+    msg = (
+        "#寄書\n"
+        f"姓名：{parsed.get('name') or ''}\n"
+        f"電話：{parsed.get('phone') or ''}\n"
+        f"寄送地址：{parsed.get('address') or ''}\n"
+        f"書籍名稱：{books_line}\n"
+        f"備註：{parsed.get('biz_note') or ''}"
+        f"{warn}"
+    )
+
+    _PENDING[event.source.user_id] = {
+        "type": "整理寄書_confirm",
+        "data": parsed,
+    }
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text="請確認以下資訊：\n\n" + msg + "\n\n回覆 OK / YES 確認；回覆 N 取消。")
+    )
+
 
 def _handle_new_order(event, text):
     try:
@@ -1399,6 +1491,21 @@ def _handle_pending_answer(event, text):
             f"寄送地址：{data['address']}\n"
             f"書籍名稱：{data['book_raw']}\n"
             f"業務備註：{data['biz_note']}"
+        )
+        _handle_new_order(event, fake_text)
+        _PENDING.pop(event.source.user_id, None)
+        return True
+
+    if pend["type"] == "整理寄書_confirm":
+        data = pend["data"]
+        book_raw = data.get("book_raw") or ""
+        fake_text = (
+            "#寄書\n"
+            f"姓名：{data.get('name') or ''}\n"
+            f"電話：{data.get('phone') or ''}\n"
+            f"寄送地址：{data.get('address') or ''}\n"
+            f"書籍名稱：{book_raw}\n"
+            f"業務備註：{data.get('biz_note') or ''}"
         )
         _handle_new_order(event, fake_text)
         _PENDING.pop(event.source.user_id, None)
