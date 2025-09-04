@@ -404,39 +404,55 @@ def get_book_index():
     return BOOK_INDEX_CACHE
 
 def resolve_book_name(user_input: str):
+    """輸入一段文字，回傳：(正式書名, 比對方式, 候選清單)"""
     src_norm = _normalize_for_match(user_input)
     if not src_norm:
         return (None, "notfound", [])
 
     books = get_book_index()
 
-    # 1) 完整包含比對（最長優先）
+    # 1) 完全相等
     for b in books:
         for alias in b["aliases"]:
-            if alias["norm"] and alias["norm"] in src_norm:
+            if src_norm == alias["norm"]:
+                return (b["title"], "exact", None)
+
+    # 2) 完整包含（僅長度 >=4 的 alias 才算，避免亂抓短詞）
+    for b in books:
+        for alias in b["aliases"]:
+            if len(alias["norm"]) >= 4 and alias["norm"] in src_norm:
                 return (b["title"], "contain", None)
 
-    # 2) 完全相等
-    for b in books:
-        if any(src_norm == alias["norm"] for alias in b["aliases"]):
-            return (b["title"], "exact", None)
-
-    # 3) Fuzzy 比對
+    # 3) Fuzzy 比對（忽略過短 alias，除非是字母+數字）
     universe, reverse_map = [], {}
     for b in books:
         for alias in b["aliases"]:
-            universe.append(alias["norm"])
-            reverse_map[alias["norm"]] = b["title"]
-    matches = difflib.get_close_matches(src_norm, universe, n=5, cutoff=FUZZY_THRESHOLD)
+            norm = alias["norm"]
+            if not norm:
+                continue
+            # alias 過濾規則
+            if len(norm) < 3:
+                # 保留字母+數字（像 S1、N5）
+                if not re.match(r"^[a-z]\d$", norm):
+                    continue
+            universe.append(norm)
+            reverse_map[norm] = b["title"]
+
+    # 調高精確度門檻
+    matches = difflib.get_close_matches(src_norm, universe, n=5, cutoff=0.8)
     if not matches:
         return (None, "notfound", [])
+
     formal = []
     for m in matches:
         fm = reverse_map.get(m)
         if fm and fm not in formal:
             formal.append(fm)
+
     if len(formal) == 1:
         return (formal[0], "fuzzy", None)
+
+    # 多個候選 → 視為不明確
     return (None, "ambiguous", formal)
 
 
