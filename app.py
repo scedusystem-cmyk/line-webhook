@@ -468,22 +468,27 @@ def resolve_book_name(user_input: str):
 # ========== 抽書名（整句最長優先＋數字相符） ==========
 def _extract_books_and_note_from_text(user_text: str):
     """
-    從原始一句話中，找出『書名』(可多本) 與『備註』。
+    從原始一句話中，抽出『書名』(可多本) 與『備註』。
     規則：
-      - 先把所有書目的別名攤平成清單，依「別名長度」由長到短檢查
-      - 若輸入中有數字，僅允許別名也含『相同數字』的書命中（避免 LG1 與 LG6 混淆）
-      - 命中後把該別名自原句移除，剩餘即為備註
+      - alias_norm 必須完整包含於 input_norm（避免只靠數字命中）
+      - 若輸入含數字，alias 也需含相同數字（至少一個相同）
+      - 若 alias 含英文，至少一段長度 >=3 的英文字片段要在輸入裡
+      - 命中後，用寬鬆 token（英文字片段與數字）把原句中的別名清乾淨，剩下即備註
     回傳：(books: List[str], note: str)
     """
     raw = (user_text or "").strip()
-    norm = _normalize_for_match(raw)
-    if not norm:
-        return [], raw
+    if not raw:
+        return [], ""
 
-    # 取輸入中的數字（例如 "Lets Go 6 扣點" -> {"6"})
+    # 供「包含判斷」用的壓縮字串（小寫、去空白與標點、非 ASCII 會被剔除）
+    def _ascii_compact(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "", (s or "").lower())
+
+    input_norm = _normalize_for_match(raw)      # 小寫、去空白/標點（非 ASCII 也會被清）
+    input_ascii = _ascii_compact(raw)           # 只留下 A-Z0-9，方便比對英文片段
     digits_in_input = set(re.findall(r"\d+", raw))
 
-    # 攤平所有書的所有別名，依長度由長到短
+    # 攤平所有別名並按「正規化長度」由長到短（避免 Try N 壓過 Try N5）
     flat_aliases = []
     for b in get_book_index():
         for a in b["aliases"]:
@@ -491,39 +496,53 @@ def _extract_books_and_note_from_text(user_text: str):
     flat_aliases.sort(key=lambda t: len(t[2] or ""), reverse=True)
 
     matched_titles = []
-    matched_alias_raws = []
+    tokens_for_cleanup = []   # 用來從原句移除的 token（英文字片段與數字）
     seen_titles = set()
 
     for title, alias_raw, alias_norm in flat_aliases:
-        if title in seen_titles:
-            continue
-        if not alias_norm:
+        if title in seen_titles or not alias_norm:
             continue
 
-        # 若輸入有數字，要求別名也帶到相同數字（至少重疊一個）
+        # 1) 必須是「別名正規化完整包含於輸入正規化」
+        if alias_norm not in input_norm:
+            continue
+
+        # 2) 若輸入含數字 → alias 也要含相同數字（至少一個）
         if digits_in_input:
             alias_digits = set(re.findall(r"\d+", alias_raw))
             if not alias_digits.intersection(digits_in_input):
                 continue
 
-        # 只用「完整包含」判斷（alias_norm 必須整段在輸入 norm 中）
-        if alias_norm in norm:
-            matched_titles.append(title)
-            matched_alias_raws.append(alias_raw)
-            seen_titles.add(title)
+        # 3) 若 alias 有英文，至少一段長度>=3的英文片段要在輸入中（防止 Discover 6 只靠數字命中）
+        alpha_tokens = re.findall(r"[A-Za-z]{3,}", alias_raw.lower())
+        if alpha_tokens and not any(tok in input_ascii for tok in alpha_tokens):
+            continue
 
-    # 從原句移除已命中的『可讀別名』，剩下即為備註
+        # 命中
+        matched_titles.append(title)
+        seen_titles.add(title)
+
+        # 準備清理 token：英文字片段（>=2）＋ 數字 ＋ 連成一條的英文（處理 Let's → lets）
+        clean_tokens = set()
+        clean_tokens.update(re.findall(r"[A-Za-z]{2,}", alias_raw))
+        clean_tokens.update(re.findall(r"\d+", alias_raw))
+        compact_alpha = "".join(re.findall(r"[A-Za-z]+", alias_raw)).lower()
+        if len(compact_alpha) >= 3:
+            clean_tokens.add(compact_alpha)
+        tokens_for_cleanup.append(clean_tokens)
+
+    # 從原句中移除所有命中的 token（大小寫不敏感）
     note = raw
-    for araw in sorted(matched_alias_raws, key=len, reverse=True):
-        note = re.sub(re.escape(araw), " ", note, flags=re.IGNORECASE)
+    for token_set in tokens_for_cleanup:
+        for tok in sorted(token_set, key=len, reverse=True):
+            note = re.sub(tok, " ", note, flags=re.IGNORECASE)
 
-    # 移除電話與常見備註詞
+    # 去掉電話與常見噪音詞後整理空白
     note = re.sub(r"09\d{8}", " ", note)
-    for w in ["扣點","補寄","重寄","改寄","改地址","贈送","補書","換書","退回","急件","備註"]:
-        note = note.replace(w, " ")
     note = re.sub(r"\s+", " ", note).strip()
 
     return matched_titles, note
+
 # ======================================================
 
 
