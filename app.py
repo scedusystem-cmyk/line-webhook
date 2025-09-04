@@ -355,56 +355,79 @@ def lookup_zip(address: str):
 # ============================================
 # 書名比對（共用）
 # ============================================
-def load_book_master():
-    ws = _ws(BOOK_MASTER_SHEET_NAME)
-    rows = ws.get_all_values()
-    if not rows:
+
+def _normalize_for_match(s: str) -> str:
+    """比對用字串正規化：小寫、去空白、去標點"""
+    return re.sub(r"[\s\W_]+", "", (s or "").lower())
+
+def _split_alias_field(field: str):
+    """把「模糊比對書名」欄位依常見分隔符拆開，並做正規化"""
+    if not field:
         return []
-    header = rows[0]
-    use_idx = 0
-    name_idx = 1
-    alias_idx = None
-    for i, col in enumerate(header):
-        t = str(col).strip()
-        if re.search(r"模糊|別名|比對", t):
-            alias_idx = i
-    data = []
-    for r in rows[1:]:
-        try:
-            enabled = str(r[use_idx]).strip()
-            if enabled != "使用中":
-                continue
-            name = (r[name_idx] if name_idx < len(r) else "").strip()
-            alias_raw = (r[alias_idx] if alias_idx is not None and alias_idx < len(r) else "").strip()
-            aliases = []
-            if alias_raw:
-                aliases = re.split(r"[、,\s\|／/]+", alias_raw)
-                aliases = [a.strip() for a in aliases if a.strip()]
-            data.append({"name": name, "aliases": aliases})
-        except Exception:
+    parts = re.split(r"[、,;|／/ ]+", field)
+    return [{"raw": p.strip(), "norm": _normalize_for_match(p)} for p in parts if p.strip()]
+
+BOOK_INDEX_CACHE = None
+
+def build_book_index(ws_books):
+    """從〈書目主檔〉建立比對索引。"""
+    data = ws_books.get_all_values()
+    if not data:
+        return []
+
+    header = {name: idx for idx, name in enumerate(data[0])}
+    def col(name, default=None): return header.get(name, default)
+
+    col_title = col("書籍名稱")
+    col_alias = col("模糊比對書名")
+    col_on    = col("是否啟用")
+
+    index = []
+    for row in data[1:]:
+        title = (row[col_title] if col_title is not None and col_title < len(row) else "").strip()
+        if not title:
             continue
-    return data
+        if col_on is not None and row[col_on].strip() != "使用中":
+            continue
+        alias_field = row[col_alias] if col_alias is not None and col_alias < len(row) else ""
+        aliases = _split_alias_field(alias_field) or _split_alias_field(title)
+        # 先長再短 → 避免「Try N」蓋掉「Try N5」
+        aliases.sort(key=lambda a: len(a["norm"]), reverse=True)
+        index.append({"title": title, "aliases": aliases})
+    return index
+
+def get_book_index():
+    global BOOK_INDEX_CACHE
+    if BOOK_INDEX_CACHE is None:
+        ws_books = _ws(BOOK_MASTER_SHEET_NAME)
+        BOOK_INDEX_CACHE = build_book_index(ws_books)
+    return BOOK_INDEX_CACHE
 
 def resolve_book_name(user_input: str):
-    src = (user_input or "").strip()
-    if not src:
+    src_norm = _normalize_for_match(user_input)
+    if not src_norm:
         return (None, "notfound", [])
-    books = load_book_master()
-    # exact
-    exact = [b for b in books if src.lower() == b["name"].lower()]
-    if exact:
-        return (exact[0]["name"], "exact", None)
-    # alias match
+
+    books = get_book_index()
+
+    # 1) 完整包含比對（最長優先）
     for b in books:
-        if any(src.lower() == a.lower() for a in b["aliases"]):
-            return (b["name"], "alias", None)
-    # fuzzy universe
+        for alias in b["aliases"]:
+            if alias["norm"] and alias["norm"] in src_norm:
+                return (b["title"], "contain", None)
+
+    # 2) 完全相等
+    for b in books:
+        if any(src_norm == alias["norm"] for alias in b["aliases"]):
+            return (b["title"], "exact", None)
+
+    # 3) Fuzzy 比對
     universe, reverse_map = [], {}
     for b in books:
-        universe.append(b["name"]); reverse_map[b["name"]] = b["name"]
-        for a in b["aliases"]:
-            universe.append(a); reverse_map[a] = b["name"]
-    matches = difflib.get_close_matches(src, universe, n=5, cutoff=FUZZY_THRESHOLD)
+        for alias in b["aliases"]:
+            universe.append(alias["norm"])
+            reverse_map[alias["norm"]] = b["title"]
+    matches = difflib.get_close_matches(src_norm, universe, n=5, cutoff=FUZZY_THRESHOLD)
     if not matches:
         return (None, "notfound", [])
     formal = []
@@ -415,6 +438,7 @@ def resolve_book_name(user_input: str):
     if len(formal) == 1:
         return (formal[0], "fuzzy", None)
     return (None, "ambiguous", formal)
+
 
 # ============================================
 # Vision Client（顯式憑證建立）
