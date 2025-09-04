@@ -812,7 +812,7 @@ def _parse_raw_to_order(text: str):
 # 功能 B：解析＋建立寄書（#寄書）
 # （★★ 多本書支援：同一ID展開多列；寄送方式也檢查地址）
 # ============================================
-_BOOK_SPLIT_RE = re.compile(r"[、，,／/\s\t]+")
+_BOOK_SPLIT_RE = re.compile(r"[、，,／/]+")
 
 def _parse_new_order_text(raw_text: str):
     data = parse_kv_lines(raw_text)
