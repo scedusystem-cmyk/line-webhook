@@ -495,12 +495,71 @@ def resolve_book_name(user_input: str):
 
 
 # ========== 抽書名（整句最長優先＋數字相符） ==========
+# === [PATCH] 備註清理強化（Let's / Lets、空白、連字號都能吃；殘渣自動忽略） ===
+def _alias_relaxed_regex(alias_raw: str) -> re.Pattern:
+    """
+    依據「原始別名」生成一個寬鬆 regex：
+    - ' / ’ / ` 視為「可有可無」
+    - 空白／斜線／連字號 視為「0~多個分隔」
+    - 其餘字元嚴格逐字比對（不分大小寫）
+    目標：讓 "Let's Go 3" 能吃到 "Lets Go 3"、"Lets-Go-3"、"LetsGo3" 等變體
+    """
+    buf = []
+    for ch in alias_raw:
+        if ch in ("'", "’", "`"):
+            buf.append(r"(?:['’`]*)")  # 可有可無
+        elif ch.isspace() or ch in "/／|-–—_":
+            buf.append(r"[\s/／\-\–\—_]*")  # 0~多個分隔
+        else:
+            buf.append(re.escape(ch))
+    pat = "".join(buf)
+    try:
+        return re.compile(pat, flags=re.IGNORECASE)
+    except Exception:
+        # 萬一組字失敗，就退回精確字串
+        return re.compile(re.escape(alias_raw), flags=re.IGNORECASE)
+
+def _cleanup_note(note: str) -> str:
+    """
+    備註殘渣過濾規則：
+    - 去手機號、引號、邊界符號、重複空白
+    - 單一英文字母/數字、總長 <2、純 ASCII 且各 token <3 → 視為無效
+    """
+    if not note:
+        return ""
+    # 再保險一次去電話
+    note = re.sub(r"09\d{8}", " ", note)
+    # 去掉引號/符號雜訊
+    note = re.sub(r'[\"\'’`]+', "", note)
+    # 合併空白
+    note = re.sub(r"\s+", " ", note).strip()
+    # 刪邊界分隔符
+    note = note.strip(" ,.;:|/\\-—–_")
+    # 極短／單字母數字 → 丟
+    if not note or len(note) <= 1:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9]{1,2}", note):
+        return ""
+    # 去掉孤立單字母（e.g., 's'）
+    note = re.sub(r"\b[a-zA-Z]\b", " ", note)
+    note = re.sub(r"\s+", " ", note).strip()
+    if not note:
+        return ""
+    # 若純 ASCII，且每個 token 都 <3 → 丟
+    if re.fullmatch(r"[A-Za-z0-9\s]+", note):
+        toks = [t for t in note.split() if t]
+        if not any(len(t) >= 3 for t in toks):
+            return ""
+    return note
+
+# ========== 抽書名（整句最長優先＋數字相符） ==========
 def _extract_books_and_note_from_text(user_text: str):
     """
     從一句話中抽出多本書與備註：
       - 使用最長優先別名；若輸入帶數字，alias 也需含相同數字（但純數字 alias 一律忽略）
       - 短代號（如 n5/lg6）必須『原樣』出現在輸入
-      - 命中後用寬鬆 token（英文片段、連成一段的字母、數字）把原句清掉
+      - 命中後用「彈性別名 regex」先清掉整段，再用 tokens 補刀
+      - 最後套用備註殘渣過濾（例如只剩 's' 這種直接視為空）
     回傳：(books, note)
     """
     raw = (user_text or "").strip()
@@ -521,7 +580,7 @@ def _extract_books_and_note_from_text(user_text: str):
             flat.append((b["title"], a["raw"], a["norm"]))
     flat.sort(key=lambda t: len(t[2] or ""), reverse=True)
 
-    books, cleanup_token_sets, seen_titles = [], [], set()
+    books, cleanup_token_sets, cleanup_patterns, seen_titles = [], [], [], set()
 
     for title, araw, anorm in flat:
         if title in seen_titles or not anorm:
@@ -537,24 +596,26 @@ def _extract_books_and_note_from_text(user_text: str):
             if not alias_digits.intersection(digits_in_input):
                 continue
 
-        # 兩種命中方式：
-        # A. 一般 alias：anorm 必須完整包含在 input_norm
+        # 命中條件（兩種）：
         hit = False
         if anorm in input_norm:
             hit = True
         else:
-            # B. 短代號（如 n5, lg6）：必須『原樣』在輸入的 ascii 裡
+            # 短代號（如 n5, lg6）：必須『原樣』在輸入的 ascii 裡
             if re.fullmatch(r"[a-z]{1,3}\d{1,2}", anorm) and anorm in input_ascii:
                 hit = True
 
         if not hit:
             continue
 
-        # 命中
+        # 命中：收書名 + 準備兩階段清理（先整段、後 token）
         books.append(title)
         seen_titles.add(title)
 
-        # 準備清理 token（英文片段>=2、數字、連成一段的英文字母）
+        # ① 整段清理（彈性 regex：吃掉 Lets / Let's / 空白 / 連字號）
+        cleanup_patterns.append(_alias_relaxed_regex(araw))
+
+        # ② token 清理（英文片段>=2、數字、連成一段的英文字也清）
         toks = set()
         toks.update(re.findall(r"[A-Za-z]{2,}", araw))
         toks.update(re.findall(r"\d+", araw))
@@ -563,21 +624,22 @@ def _extract_books_and_note_from_text(user_text: str):
             toks.add(compact_alpha)
         cleanup_token_sets.append(toks)
 
-    # 從原句清理所有 token（大小寫不敏感），確保 "Let's/Lets/LG6" 都能清掉
+    # 從原句依序清理：先整段（彈性）、再 token（補刀）
     note = raw
+    for rx in cleanup_patterns:
+        note = rx.sub(" ", note)  # 先把「完整別名變體」吃掉
     for tset in cleanup_token_sets:
         for tok in sorted(tset, key=len, reverse=True):
             note = re.sub(tok, " ", note, flags=re.IGNORECASE)
 
-    # 去掉電話，收尾空白
+    # 去掉電話、收尾空白與殘渣
     note = re.sub(r"09\d{8}", " ", note)
     note = re.sub(r"\s+", " ", note).strip()
 
+    # 最終備註過濾
+    note = _cleanup_note(note)
+
     return books, note
-
-
-# ======================================================
-
 
 # ============================================
 # Vision Client（顯式憑證建立）
