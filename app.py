@@ -369,8 +369,10 @@ def _split_alias_field(field: str):
 
 BOOK_INDEX_CACHE = None
 
+BOOK_INDEX_CACHE = None
+
 def build_book_index(ws_books):
-    """從〈書目主檔〉建立比對索引。"""
+    """從〈書目主檔〉建立比對索引：每本書至少含『完整書名』這個 alias；過濾純數字/太短 alias。"""
     data = ws_books.get_all_values()
     if not data:
         return []
@@ -387,13 +389,39 @@ def build_book_index(ws_books):
         title = (row[col_title] if col_title is not None and col_title < len(row) else "").strip()
         if not title:
             continue
-        if col_on is not None and row[col_on].strip() != "使用中":
+        if col_on is not None and (row[col_on] if col_on < len(row) else "").strip() not in ("使用中","啟用","enabled","1","true","TRUE"):
             continue
+
+        aliases = []
+        # 1) 先放入「完整書名」這一個 alias（不拆詞）
+        aliases.append({"raw": title, "norm": _normalize_for_match(title)})
+
+        # 2) 再加入欄位中的自訂別名（這個才拆分）
         alias_field = row[col_alias] if col_alias is not None and col_alias < len(row) else ""
-        aliases = _split_alias_field(alias_field) or _split_alias_field(title)
-        # 先長再短 → 避免「Try N」蓋掉「Try N5」
-        aliases.sort(key=lambda a: len(a["norm"]), reverse=True)
-        index.append({"title": title, "aliases": aliases})
+        if alias_field:
+            for a in re.split(r"[、,;|／/ ]+", alias_field):
+                a = a.strip()
+                if not a:
+                    continue
+                norm = _normalize_for_match(a)
+                # 過濾：純數字、長度過短（<2）
+                if not norm or norm.isdigit() or len(norm) < 2:
+                    continue
+                aliases.append({"raw": a, "norm": norm})
+
+        # 去重
+        seen = set()
+        uniq = []
+        for a in aliases:
+            if a["norm"] in seen:
+                continue
+            seen.add(a["norm"])
+            uniq.append(a)
+
+        # 最長優先，避免「Try N」壓掉「Try N5」
+        uniq.sort(key=lambda a: len(a["norm"]), reverse=True)
+
+        index.append({"title": title, "aliases": uniq})
     return index
 
 def get_book_index():
@@ -402,6 +430,7 @@ def get_book_index():
         ws_books = _ws(BOOK_MASTER_SHEET_NAME)
         BOOK_INDEX_CACHE = build_book_index(ws_books)
     return BOOK_INDEX_CACHE
+
 
 def resolve_book_name(user_input: str):
     """輸入一段文字，回傳：(正式書名, 比對方式, 候選清單)"""
@@ -468,80 +497,84 @@ def resolve_book_name(user_input: str):
 # ========== 抽書名（整句最長優先＋數字相符） ==========
 def _extract_books_and_note_from_text(user_text: str):
     """
-    從原始一句話中，抽出『書名』(可多本) 與『備註』。
-    規則：
-      - alias_norm 必須完整包含於 input_norm（避免只靠數字命中）
-      - 若輸入含數字，alias 也需含相同數字（至少一個相同）
-      - 若 alias 含英文，至少一段長度 >=3 的英文字片段要在輸入裡
-      - 命中後，用寬鬆 token（英文字片段與數字）把原句中的別名清乾淨，剩下即備註
-    回傳：(books: List[str], note: str)
+    從一句話中抽出多本書與備註：
+      - 使用最長優先別名；若輸入帶數字，alias 也需含相同數字（但純數字 alias 一律忽略）
+      - 短代號（如 n5/lg6）必須『原樣』出現在輸入
+      - 命中後用寬鬆 token（英文片段、連成一段的字母、數字）把原句清掉
+    回傳：(books, note)
     """
     raw = (user_text or "").strip()
     if not raw:
         return [], ""
 
-    # 供「包含判斷」用的壓縮字串（小寫、去空白與標點、非 ASCII 會被剔除）
-    def _ascii_compact(s: str) -> str:
+    def ascii_compact(s: str) -> str:
         return re.sub(r"[^A-Za-z0-9]+", "", (s or "").lower())
 
-    input_norm = _normalize_for_match(raw)      # 小寫、去空白/標點（非 ASCII 也會被清）
-    input_ascii = _ascii_compact(raw)           # 只留下 A-Z0-9，方便比對英文片段
+    input_norm  = _normalize_for_match(raw)   # 小寫 去標點/空白
+    input_ascii = ascii_compact(raw)          # 只留 A-Z0-9
     digits_in_input = set(re.findall(r"\d+", raw))
 
-    # 攤平所有別名並按「正規化長度」由長到短（避免 Try N 壓過 Try N5）
-    flat_aliases = []
+    # 攤平 alias（長到短）
+    flat = []
     for b in get_book_index():
         for a in b["aliases"]:
-            flat_aliases.append((b["title"], a["raw"], a["norm"]))
-    flat_aliases.sort(key=lambda t: len(t[2] or ""), reverse=True)
+            flat.append((b["title"], a["raw"], a["norm"]))
+    flat.sort(key=lambda t: len(t[2] or ""), reverse=True)
 
-    matched_titles = []
-    tokens_for_cleanup = []   # 用來從原句移除的 token（英文字片段與數字）
-    seen_titles = set()
+    books, cleanup_token_sets, seen_titles = [], [], set()
 
-    for title, alias_raw, alias_norm in flat_aliases:
-        if title in seen_titles or not alias_norm:
+    for title, araw, anorm in flat:
+        if title in seen_titles or not anorm:
             continue
 
-        # 1) 必須是「別名正規化完整包含於輸入正規化」
-        if alias_norm not in input_norm:
+        # 忽略純數字 alias
+        if anorm.isdigit():
             continue
 
-        # 2) 若輸入含數字 → alias 也要含相同數字（至少一個）
+        # 若輸入含數字 → alias 也要含相同數字（至少一個）
         if digits_in_input:
-            alias_digits = set(re.findall(r"\d+", alias_raw))
+            alias_digits = set(re.findall(r"\d+", araw))
             if not alias_digits.intersection(digits_in_input):
                 continue
 
-        # 3) 若 alias 有英文，至少一段長度>=3的英文片段要在輸入中（防止 Discover 6 只靠數字命中）
-        alpha_tokens = re.findall(r"[A-Za-z]{3,}", alias_raw.lower())
-        if alpha_tokens and not any(tok in input_ascii for tok in alpha_tokens):
+        # 兩種命中方式：
+        # A. 一般 alias：anorm 必須完整包含在 input_norm
+        hit = False
+        if anorm in input_norm:
+            hit = True
+        else:
+            # B. 短代號（如 n5, lg6）：必須『原樣』在輸入的 ascii 裡
+            if re.fullmatch(r"[a-z]{1,3}\d{1,2}", anorm) and anorm in input_ascii:
+                hit = True
+
+        if not hit:
             continue
 
         # 命中
-        matched_titles.append(title)
+        books.append(title)
         seen_titles.add(title)
 
-        # 準備清理 token：英文字片段（>=2）＋ 數字 ＋ 連成一條的英文（處理 Let's → lets）
-        clean_tokens = set()
-        clean_tokens.update(re.findall(r"[A-Za-z]{2,}", alias_raw))
-        clean_tokens.update(re.findall(r"\d+", alias_raw))
-        compact_alpha = "".join(re.findall(r"[A-Za-z]+", alias_raw)).lower()
+        # 準備清理 token（英文片段>=2、數字、連成一段的英文字母）
+        toks = set()
+        toks.update(re.findall(r"[A-Za-z]{2,}", araw))
+        toks.update(re.findall(r"\d+", araw))
+        compact_alpha = "".join(re.findall(r"[A-Za-z]+", araw)).lower()
         if len(compact_alpha) >= 3:
-            clean_tokens.add(compact_alpha)
-        tokens_for_cleanup.append(clean_tokens)
+            toks.add(compact_alpha)
+        cleanup_token_sets.append(toks)
 
-    # 從原句中移除所有命中的 token（大小寫不敏感）
+    # 從原句清理所有 token（大小寫不敏感），確保 "Let's/Lets/LG6" 都能清掉
     note = raw
-    for token_set in tokens_for_cleanup:
-        for tok in sorted(token_set, key=len, reverse=True):
+    for tset in cleanup_token_sets:
+        for tok in sorted(tset, key=len, reverse=True):
             note = re.sub(tok, " ", note, flags=re.IGNORECASE)
 
-    # 去掉電話與常見噪音詞後整理空白
+    # 去掉電話，收尾空白
     note = re.sub(r"09\d{8}", " ", note)
     note = re.sub(r"\s+", " ", note).strip()
 
-    return matched_titles, note
+    return books, note
+
 
 # ======================================================
 
