@@ -253,6 +253,49 @@ def col_to_letter(col: int) -> str:
     return s
 
 # ============================================
+# 功能 X：原始資料 → #寄書 格式化（for #整理寄書）
+# ============================================
+def _parse_raw_to_order(text: str):
+    """
+    輸入：多行原始資料（姓名/電話/書名 + 地址 + 備註）
+    輸出：dict（name, phone, address, book_raw, biz_note）
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None, ["❌ 沒有讀到任何內容"]
+
+    # 預設：第一行（姓名 + 電話 + 書名）
+    first = lines[0]
+    rest = lines[1:]
+
+    # 電話
+    phone = None
+    m = re.search(r"(09\d{8})", first)
+    if m:
+        phone = m.group(1)
+        first = first.replace(phone, "").strip()
+
+    # 姓名 + 書名（電話去掉後）
+    tokens = first.split()
+    name = tokens[0] if tokens else None
+    book_raw = " ".join(tokens[1:]) if len(tokens) > 1 else None
+
+    # 地址（取剩下第一行）
+    address, notes = None, []
+    if rest:
+        address = rest[0].replace(" ", "")
+        if len(rest) > 1:
+            notes = rest[1:]
+
+    return {
+        "name": name,
+        "phone": phone,
+        "address": address,
+        "book_raw": book_raw,
+        "biz_note": " / ".join(notes)
+    }, []
+
+# ============================================
 # 寄送方式偵測（只偵測便利商店；其餘交由後續規則）
 # ============================================
 def detect_delivery_method(text: str):
@@ -629,6 +672,41 @@ def _handle_new_order(event, text):
         f"狀態：待處理"
     )
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
+
+# ============================================
+# 功能 X-2：#整理寄書（原始資料 → 標準 #寄書 格式 → 等待確認）
+# ============================================
+def _handle整理寄書(event, text):
+    body = re.sub(r"^#整理寄書\s*", "", text.strip())
+    parsed, errs = _parse_raw_to_order(body)
+    if errs:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(errs)))
+        return
+
+    # 組成標準格式
+    msg = (
+        "#寄書\n"
+        f"姓名：{parsed['name']}\n"
+        f"電話：{parsed['phone']}\n"
+        f"寄送地址：{parsed['address']}\n"
+        f"書籍名稱：{parsed['book_raw']}\n"
+        f"備註：{parsed['biz_note']}"
+    )
+
+    # 存入 pending，等待使用者回覆 OK
+    _PENDING[event.source.user_id] = {
+        "type": "整理寄書_confirm",
+        "data": parsed,
+    }
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(
+            text="請確認以下資訊：\n\n"
+                 + msg +
+                 "\n\n回覆 OK / YES 確認；回覆 N 取消。"
+        )
+    )
+
 
 # ============================================
 # 功能 C：查詢寄書（預設不顯示「已刪除」）
@@ -1311,6 +1389,21 @@ def _handle_pending_answer(event, text):
         _PENDING.pop(event.source.user_id, None)
         return True
 
+    if pend["type"] == "整理寄書_confirm":
+        # 將資料轉換成 #寄書 格式文字，交給既有的 _handle_new_order
+        data = pend["data"]
+        fake_text = (
+            "#寄書\n"
+            f"姓名：{data['name']}\n"
+            f"電話：{data['phone']}\n"
+            f"寄送地址：{data['address']}\n"
+            f"書籍名稱：{data['book_raw']}\n"
+            f"業務備註：{data['biz_note']}"
+        )
+        _handle_new_order(event, fake_text)
+        _PENDING.pop(event.source.user_id, None)
+        return True
+
     return False
 
 # ============================================
@@ -1360,6 +1453,10 @@ def handle_text_message(event):
         return
 
     # 僅處理以下指令；其餘直接不回覆
+
+    if text.startswith("#整理寄書"):
+        _handle整理寄書(event, text); return
+    
     if text.startswith("#寄書"):
         _handle_new_order(event, text); return
 
