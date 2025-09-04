@@ -409,6 +409,9 @@ def resolve_book_name(user_input: str):
     if not src_norm:
         return (None, "notfound", [])
 
+    # 🔑 擷取數字（例：N5 / Go6 → 5 or 6）
+    digits = re.findall(r"\d+", user_input)
+
     books = get_book_index()
 
     # 1) 完全相等
@@ -417,28 +420,34 @@ def resolve_book_name(user_input: str):
             if src_norm == alias["norm"]:
                 return (b["title"], "exact", None)
 
-    # 2) 完整包含（僅長度 >=4 的 alias 才算，避免亂抓短詞）
-    for b in books:
+    # 2) 若有數字 → 僅鎖定含該數字的書
+    narrowed_books = books
+    if digits:
+        narrowed_books = []
+        for b in books:
+            if any(d in a["norm"] for a in b["aliases"] for d in digits):
+                narrowed_books.append(b)
+        if not narrowed_books:
+            return (None, "notfound", [])
+
+    # 3) 完整包含（僅長度 >=4 的 alias 才算）
+    for b in narrowed_books:
         for alias in b["aliases"]:
             if len(alias["norm"]) >= 4 and alias["norm"] in src_norm:
                 return (b["title"], "contain", None)
 
-    # 3) Fuzzy 比對（忽略過短 alias，除非是字母+數字）
+    # 4) Fuzzy 比對（忽略過短 alias）
     universe, reverse_map = [], {}
-    for b in books:
+    for b in narrowed_books:
         for alias in b["aliases"]:
             norm = alias["norm"]
             if not norm:
                 continue
-            # alias 過濾規則
-            if len(norm) < 3:
-                # 保留字母+數字（像 S1、N5）
-                if not re.match(r"^[a-z]\d$", norm):
-                    continue
+            if len(norm) < 3 and not re.match(r"^[a-z]\d$", norm):
+                continue
             universe.append(norm)
             reverse_map[norm] = b["title"]
 
-    # 調高精確度門檻
     matches = difflib.get_close_matches(src_norm, universe, n=5, cutoff=0.8)
     if not matches:
         return (None, "notfound", [])
@@ -452,8 +461,8 @@ def resolve_book_name(user_input: str):
     if len(formal) == 1:
         return (formal[0], "fuzzy", None)
 
-    # 多個候選 → 視為不明確
     return (None, "ambiguous", formal)
+
 
 
 # ============================================
