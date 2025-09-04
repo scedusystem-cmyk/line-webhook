@@ -1029,7 +1029,7 @@ def _clear_ocr_session(user_id: str):
     _OCR_SESSION.pop(user_id, None)
 
 # ============================================
-# 功能 F：OCR 解析 + 寫回託運單資訊
+# 功能 F：OCR 解析 + 寫回託運單資訊（加強版除錯）
 # ============================================
 def _download_line_image_bytes(message_id: str) -> bytes:
     content = line_bot_api.get_message_content(message_id)
@@ -1081,16 +1081,23 @@ def _pair_ids_with_numbers(text: str):
 
     return pairs, leftovers
 
+# ★★ 加強版 OCR 寫回函數（詳細除錯日誌）
 def _write_ocr_results(pairs, event):
     if not pairs:
         return "❗ 未寫入任何資料（未找到配對）"
+    
     ws = _ws(MAIN_SHEET_NAME)
     h = _get_header_map(ws)
+    
+    # 記錄表頭資訊
+    app.logger.info(f"[OCR_DEBUG] Header map: {h}")
+    
     idxA = _col_idx(h, "紀錄ID", 1)
     idxJ = _col_idx(h, "寄出日期", 10)
     idxK = _col_idx(h, "託運單號", 11)
     idxL = _col_idx(h, "經手人", 12)
     idxM = _col_idx(h, "寄送狀態", 13)
+    idxD = _col_idx(h, "學員姓名", 4)  # 用於除錯
 
     try:
         profile = line_bot_api.get_profile(event.source.user_id)
@@ -1099,34 +1106,69 @@ def _write_ocr_results(pairs, event):
         uploader = "LINE使用者"
 
     all_vals = ws.get_all_values()
-    rows = all_vals[1:]
+    app.logger.info(f"[OCR_DEBUG] Total rows in sheet: {len(all_vals)}")
+    
+    rows = all_vals[1:]  # 跳過表頭
+
+    # ★★ 改用更安全的方式建立 RID 映射
     id2rows = {}
     for ridx, r in enumerate(rows, start=2):
         try:
+            # 確保有足夠的欄位
+            if len(r) < idxA:
+                app.logger.warning(f"[OCR_DEBUG] Row {ridx} has insufficient columns: {len(r)}")
+                continue
+                
             rid = (r[idxA-1] or "").strip()
             if re.fullmatch(r"R\d{4}", rid):
-                # ★★ 多列同一RID → 覆蓋所有列的出貨資訊（確保一致）
+                # 記錄找到的RID和對應行號、姓名（用於除錯）
+                student_name = r[idxD-1] if len(r) >= idxD else "N/A"
+                app.logger.info(f"[OCR_DEBUG] Found RID {rid} at row {ridx}, student: {student_name}")
                 id2rows.setdefault(rid, []).append(ridx)
-        except Exception:
+        except Exception as e:
+            app.logger.error(f"[OCR_DEBUG] Error processing row {ridx}: {e}")
             continue
+
+    app.logger.info(f"[OCR_DEBUG] RID mapping: {id2rows}")
 
     updated = []
     for rid, no in pairs:
         row_is = id2rows.get(rid, [])
+        app.logger.info(f"[OCR_DEBUG] Updating RID {rid} with number {no} at rows: {row_is}")
+        
         if not row_is:
+            app.logger.warning(f"[OCR_DEBUG] RID {rid} not found in sheets")
             continue
+            
+        # 對同一RID的所有列都寫入相同的出貨資訊
         for row_i in row_is:
-            ws.update_cell(row_i, idxK, f"'{no}")
-            ws.update_cell(row_i, idxJ, today_str())
-            ws.update_cell(row_i, idxL, uploader)
-            ws.update_cell(row_i, idxM, "已託運")
+            try:
+                # 逐一更新每個欄位並記錄
+                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting tracking number to {no}")
+                ws.update_cell(row_i, idxK, f"'{no}")
+                
+                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting ship date to {today_str()}")
+                ws.update_cell(row_i, idxJ, today_str())
+                
+                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting handler to {uploader}")
+                ws.update_cell(row_i, idxL, uploader)
+                
+                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting status to 已託運")
+                ws.update_cell(row_i, idxM, "已託運")
+                
+            except Exception as e:
+                app.logger.error(f"[OCR_DEBUG] Error updating row {row_i}: {e}")
+                continue
+                
         updated.append((rid, no))
 
     if not updated:
         return "❗ 未寫入（找不到對應的紀錄ID）"
 
     lines = [f"{rid} → {no}" for rid, no in updated]
-    return "✅ 已更新：{} 筆\n{}".format(len(updated), "\n".join(lines))
+    result_msg = "✅ 已更新：{} 筆\n{}".format(len(updated), "\n".join(lines))
+    app.logger.info(f"[OCR_DEBUG] Final result: {result_msg}")
+    return result_msg
 
 # ============================================
 # 功能 H：入庫（#買書 / #入庫；支援負數＝盤點調整）
