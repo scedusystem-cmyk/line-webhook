@@ -98,9 +98,9 @@ def _build_gspread_client():
     if os.path.exists(json_path):
         creds = Credentials.from_service_account_file(json_path, scopes=SCOPES)
         return gspread.authorize(creds)
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
     if not sa_json:
-        raise RuntimeError("Missing service account credentials. Provide service_account.json OR env GOOGLE_SERVICE_ACCOUNT_JSON.")
+        raise RuntimeError("Missing service account credentials. Provide service_account.json OR env GOOGLE_SERVICE_ACCOUNT_JSON_NEW.")
     creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -654,7 +654,7 @@ def _build_vision_client():
         if os.path.exists(json_path):
             creds = gcp_service_account.Credentials.from_service_account_file(json_path)
         else:
-            sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+            sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
             if not sa_json:
                 raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON for Vision client.")
             creds = gcp_service_account.Credentials.from_service_account_info(json.loads(sa_json))
