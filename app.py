@@ -656,7 +656,7 @@ def _build_vision_client():
         else:
             sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
             if not sa_json:
-                raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON for Vision client.")
+                raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON_NEW for Vision client.")
             creds = gcp_service_account.Credentials.from_service_account_info(json.loads(sa_json))
         _vision_client = vision.ImageAnnotatorClient(credentials=creds)
         return _vision_client
@@ -1419,7 +1419,7 @@ def _download_line_image_bytes(message_id: str) -> bytes:
 
 def _ocr_text_from_bytes(img_bytes: bytes) -> str:
     if not _vision_client:
-        raise RuntimeError("Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON 已設定，且專案已啟用 Vision API）。")
+        raise RuntimeError("Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON_NEW 已設定，且專案已啟用 Vision API）。")
     image = vision.Image(content=img_bytes)
     resp = _vision_client.text_detection(image=image)
     if resp.error.message:
@@ -1819,7 +1819,7 @@ def handle_image_message(event):
             # 有啟動OCR會話，但 Vision 未設定 → 回覆錯誤
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="❌ OCR 錯誤：Vision 未初始化（請設定 GOOGLE_SERVICE_ACCOUNT_JSON 並啟用 Vision API）。")
+                TextSendMessage(text="❌ OCR 錯誤：Vision 未初始化（請設定 GOOGLE_SERVICE_ACCOUNT_JSON_NEW 並啟用 Vision API）。")
             )
             return
 
