@@ -20,6 +20,10 @@
 # - 功能 J：只回覆指定指令／其他一律不回覆
 # ============================================
 
+import os, json
+print("Loaded JSON:", bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW")))
+
+
 from flask import Flask, request, abort
 import os, re, io, json, difflib, logging, time
 from datetime import datetime, timedelta
