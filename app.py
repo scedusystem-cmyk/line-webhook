@@ -435,48 +435,50 @@ def _load_books(force: bool = False) -> List[Dict[str, Any]]:
         return _BOOK_CACHE["books"]  # 回傳舊快取
 
 def _search_books_by_keyword(keyword: str) -> List[Dict[str, Any]]:
-    """根據關鍵字搜尋書籍（新功能）"""
+    """根據關鍵字搜尋書籍（處理全形/半形差異）"""
     books = _load_books()
-    keyword_lower = keyword.lower()
+    keyword_normalized = _normalize_text_for_search(keyword).lower()
     results = []
     
     for book in books:
         # 搜尋書名、語別、模糊比對欄位
-        search_text = f"{book['name']} {book['lang']} {book['fuzzy']}".lower()
-        if keyword_lower in search_text:
+        search_text = _normalize_text_for_search(f"{book['name']} {book['lang']} {book['fuzzy']}").lower()
+        if keyword_normalized in search_text:
             results.append(book)
     
     app.logger.info(f"[BOOK] 搜尋「{keyword}」找到 {len(results)} 本")
     return results
 
 def _find_book_exact(name: str) -> Optional[str]:
-    """精確查找書名"""
+    """精確查找書名（處理全形/半形差異）"""
     books = _load_books()
-    name_lower = name.lower().strip()
+    name_normalized = _normalize_text_for_search(name).lower().strip()
     
     # 1. 精確比對書名
     for book in books:
-        if book["name"].lower() == name_lower:
+        book_name_normalized = _normalize_text_for_search(book["name"]).lower()
+        if book_name_normalized == name_normalized:
             return book["name"]
     
     # 2. 模糊比對欄位
     for book in books:
-        fuzzy_names = [x.strip().lower() for x in book["fuzzy"].split() if x.strip()]
-        if name_lower in fuzzy_names:
+        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
+        fuzzy_names = [x.strip() for x in fuzzy_normalized.split() if x.strip()]
+        if name_normalized in fuzzy_names:
             return book["name"]
     
     return None
 
 def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> List[str]:
-    """根據錯誤書名建議選項（優先關鍵字搜尋）"""
+    """根據錯誤書名建議選項（優先關鍵字搜尋，處理全形/半形）"""
     books = _load_books()
-    wrong_lower = wrong_name.lower().strip()
+    wrong_normalized = _normalize_text_for_search(wrong_name).lower().strip()
     
     # 策略 1：關鍵字搜尋（搜尋書名和模糊欄位）
     keyword_matches = []
     for book in books:
-        search_text = f"{book['name']} {book['fuzzy']}".lower()
-        if wrong_lower in search_text:
+        search_text = _normalize_text_for_search(f"{book['name']} {book['fuzzy']}").lower()
+        if wrong_normalized in search_text:
             keyword_matches.append(book["name"])
     
     if keyword_matches:
@@ -485,8 +487,9 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
     
     # 策略 2：模糊比對欄位精確匹配
     for book in books:
-        fuzzy_names = [x.strip().lower() for x in book["fuzzy"].split() if x.strip()]
-        if wrong_lower in fuzzy_names:
+        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
+        fuzzy_names = [x.strip() for x in fuzzy_normalized.split() if x.strip()]
+        if wrong_normalized in fuzzy_names:
             app.logger.info(f"[BOOK] 模糊欄位精確匹配「{wrong_name}」→ {book['name']}")
             return [book["name"]]
     
@@ -494,13 +497,15 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
     candidates = []
     for book in books:
         # 比對書名
-        ratio = difflib.SequenceMatcher(None, wrong_lower, book["name"].lower()).ratio()
+        book_name_normalized = _normalize_text_for_search(book["name"]).lower()
+        ratio = difflib.SequenceMatcher(None, wrong_normalized, book_name_normalized).ratio()
         candidates.append((ratio, book["name"]))
         
         # 比對模糊欄位
-        for fuzzy in book["fuzzy"].split():
+        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
+        for fuzzy in fuzzy_normalized.split():
             if fuzzy.strip():
-                ratio2 = difflib.SequenceMatcher(None, wrong_lower, fuzzy.strip().lower()).ratio()
+                ratio2 = difflib.SequenceMatcher(None, wrong_normalized, fuzzy.strip()).ratio()
                 candidates.append((ratio2, book["name"]))
     
     # 排序並去重
@@ -527,6 +532,25 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
 # ============================================
 # 郵遞區號查詢（修復 H2）
 # ============================================
+def _normalize_text_for_search(text: str) -> str:
+    """正規化文字用於搜尋（處理全形/半形差異）"""
+    if not text:
+        return ""
+    
+    # 全形轉半形對照表
+    # 全形數字：０-９ (U+FF10 - U+FF19)
+    # 全形英文：Ａ-Ｚ、ａ-ｚ (U+FF21-U+FF3A, U+FF41-U+FF5A)
+    result = []
+    for char in text:
+        code = ord(char)
+        # 全形英文和數字轉半形 (0xFF01-0xFF5E → 0x0021-0x007E)
+        if 0xFF01 <= code <= 0xFF5E:
+            result.append(chr(code - 0xFEE0))
+        else:
+            result.append(char)
+    
+    return ''.join(result)
+
 def _normalize_address_for_compare(text: str) -> str:
     """正規化地址用於比對（處理台/臺差異）"""
     # 統一將「臺」轉換為「台」進行比對
@@ -719,7 +743,7 @@ def _write_ocr_results(pairs: List[Tuple[str, str]], event) -> str:
 # 寄書功能（含驗證與引導修正）
 # ============================================
 def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
-    """驗證寄書資料，只回傳真正有問題的欄位（新功能）"""
+    """驗證寄書資料，只回傳真正有問題的欄位（支援多書逐本確認）"""
     errors = {
         "name": [],
         "phone": [],
@@ -750,7 +774,7 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
         if not zip_code:
             errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
     
-    # 驗證書籍
+    # 驗證書籍（收集所有錯誤書名，但不立即提示建議）
     book_raw = data.get("book", "").strip()
     if not book_raw:
         errors["books"].append("書籍名稱為必填")
@@ -764,21 +788,179 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
                 invalid_books.append(book_name)
         
         if invalid_books:
-            for wrong_name in invalid_books:
-                suggestions = _suggest_books(wrong_name)
-                if suggestions:
-                    errors["books"].append({
-                        "wrong": wrong_name,
-                        "suggestions": suggestions
-                    })
-                else:
-                    errors["books"].append({
-                        "wrong": wrong_name,
-                        "suggestions": []
-                    })
+            # 只記錄錯誤的書名，不在這裡產生建議
+            errors["books"] = invalid_books
     
     # 移除空錯誤（只回傳真正有問題的）
     return {k: v for k, v in errors.items() if v}
+
+def _format_validation_errors_simple(errors: Dict[str, List]) -> str:
+    """格式化簡單驗證錯誤訊息（姓名、電話、地址）"""
+    lines = ["❌ 發現以下問題：\n"]
+    error_num = 1
+    
+    if "name" in errors:
+        for err in errors["name"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    if "phone" in errors:
+        for err in errors["phone"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    if "address" in errors:
+        for err in errors["address"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    lines.append("\n請重新輸入完整 #寄書 資料")
+    return "\n".join(lines)
+
+def _start_book_selection(event, validation_data: Dict, invalid_books: List[str], biz_note: str):
+    """啟動逐本選書流程（新功能）"""
+    user_id = event.source.user_id
+    
+    # 為每本錯誤的書找建議
+    books_with_suggestions = []
+    for wrong_name in invalid_books:
+        suggestions = _suggest_books(wrong_name)
+        books_with_suggestions.append({
+            "wrong": wrong_name,
+            "suggestions": suggestions
+        })
+    
+    # 找到第一本有建議的書
+    current_book = None
+    for book_info in books_with_suggestions:
+        if book_info["suggestions"]:
+            current_book = book_info
+            break
+    
+    if not current_book:
+        # 所有書都找不到建議
+        msg = "❌ 找不到以下書籍：\n"
+        msg += "\n".join([f"• {b['wrong']}" for b in books_with_suggestions])
+        msg += "\n\n請使用「#查書名」確認正確書名"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return
+    
+    # 儲存選書狀態（加入超時機制）
+    _PENDING[user_id] = {
+        "type": "book_selection_step",
+        "expire_at": time.time() + 300,  # 5分鐘超時
+        "validation_data": validation_data,
+        "biz_note": biz_note,
+        "all_books": books_with_suggestions,
+        "current_index": 0,
+        "selected_books": []
+    }
+    
+    # 顯示第一本書的選單
+    _show_book_selection_prompt(event, current_book, 1, len(books_with_suggestions))
+
+def _show_book_selection_prompt(event, book_info: Dict, current: int, total: int):
+    """顯示選書提示（新函式）"""
+    lines = [f"❌ 找不到書籍：「{book_info['wrong']}」（第 {current}/{total} 本）\n"]
+    
+    if book_info["suggestions"]:
+        lines.append("💡 建議書籍：")
+        for i, sugg in enumerate(book_info["suggestions"], start=1):
+            lines.append(f"[{i}] {sugg}")
+    
+    lines.append("\n請回覆數字選擇，或回覆「取消」結束")
+    
+    msg = "\n".join(lines)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+def _handle_book_selection_step(event, text: str) -> bool:
+    """處理逐本選書流程（新函式）"""
+    user_id = event.source.user_id
+    pend = _PENDING.get(user_id)
+    
+    if not pend or pend.get("type") != "book_selection_step":
+        return False
+    
+    # 檢查超時
+    if time.time() > pend.get("expire_at", 0):
+        _PENDING.pop(user_id, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⏱️ 選書流程已超時，請重新輸入 #寄書"))
+        return True
+    
+    ans = text.strip().upper()
+    
+    # 取消
+    if ans in ("取消", "CANCEL", "N"):
+        _PENDING.pop(user_id, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消選書流程"))
+        return True
+    
+    # 檢查是否為數字
+    if not ans.isdigit():
+        return False
+    
+    choice = int(ans)
+    current_index = pend["current_index"]
+    all_books = pend["all_books"]
+    current_book = all_books[current_index]
+    
+    # 檢查選擇是否有效
+    if choice < 1 or choice > len(current_book["suggestions"]):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 無效的選項，請選擇 1-{len(current_book['suggestions'])}"))
+        return True
+    
+    # 記錄選擇
+    selected = current_book["suggestions"][choice - 1]
+    pend["selected_books"].append(selected)
+    app.logger.info(f"[BOOK] 使用者選擇：{current_book['wrong']} → {selected}")
+    
+    # 移到下一本
+    next_index = current_index + 1
+    
+    # 找下一本有建議的書
+    next_book = None
+    while next_index < len(all_books):
+        if all_books[next_index]["suggestions"]:
+            next_book = all_books[next_index]
+            pend["current_index"] = next_index
+            break
+        next_index += 1
+    
+    if next_book:
+        # 還有下一本，繼續選
+        _show_book_selection_prompt(event, next_book, next_index + 1, len(all_books))
+        return True
+    else:
+        # 全部選完，建立訂單
+        validation_data = pend["validation_data"]
+        biz_note = pend["biz_note"]
+        
+        # 組合最終書名（包含已選擇的和原本正確的）
+        original_books = [x.strip() for x in re.split(r"[,，、;；\n]+", validation_data["book"]) if x.strip()]
+        final_books = []
+        
+        selected_index = 0
+        for book_name in original_books:
+            matched = _find_book_exact(book_name)
+            if matched:
+                final_books.append(matched)
+            else:
+                if selected_index < len(pend["selected_books"]):
+                    final_books.append(pend["selected_books"][selected_index])
+                    selected_index += 1
+        
+        final_book_str = "、".join(final_books)
+        
+        _PENDING.pop(user_id, None)
+        _create_order_confirmed(
+            event,
+            validation_data["name"],
+            validation_data["phone"],
+            validation_data["address"],
+            final_book_str,
+            biz_note
+        )
+        return True
 
 def _format_validation_errors(errors: Dict[str, List]) -> str:
     """格式化驗證錯誤訊息（只顯示真正有問題的欄位）"""
@@ -836,7 +1018,17 @@ def _format_validation_errors(errors: Dict[str, List]) -> str:
     return "\n".join(lines)
 
 def _handle_new_order(event, text: str):
-    """處理新寄書（含驗證，修復 M2：統一命名）"""
+    """處理新寄書（含驗證，支援逐本確認）"""
+    user_id = event.source.user_id
+    
+    # 檢查是否有未完成的流程
+    if user_id in _PENDING:
+        pend_type = _PENDING[user_id].get("type", "")
+        if pend_type == "book_selection_step":
+            msg = "⚠️ 您有未完成的選書流程\n\n回覆「取消」可清除，或繼續完成選書"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            return
+    
     lines_after = text.replace("#寄書", "").strip()
     data = parse_kv_lines(lines_after)
     
@@ -856,19 +1048,16 @@ def _handle_new_order(event, text: str):
     
     errors = _validate_order_data(validation_data)
     
-    if errors:
-        # 有錯誤，進入引導流程
-        error_msg = _format_validation_errors(errors)
-        
-        # 儲存待修正資料
-        _PENDING[event.source.user_id] = {
-            "type": "order_correction",
-            "data": validation_data,
-            "errors": errors,
-            "biz_note": biz_note
-        }
-        
+    # 如果有姓名、電話、地址錯誤，直接提示
+    if "name" in errors or "phone" in errors or "address" in errors:
+        error_msg = _format_validation_errors_simple(errors)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+        return
+    
+    # 如果有書籍錯誤，啟動逐本確認流程
+    if "books" in errors:
+        invalid_books = errors["books"]
+        _start_book_selection(event, validation_data, invalid_books, biz_note)
         return
     
     # 無錯誤，直接建立訂單
@@ -1368,15 +1557,20 @@ def _handle_organize_order(event, text: str):
 # ============================================
 def _handle_pending_answer(event, text: str) -> bool:
     """處理待確認回答"""
-    pend = _PENDING.get(event.source.user_id)
+    user_id = event.source.user_id
+    pend = _PENDING.get(user_id)
     if not pend:
         return False
+    
+    # 處理逐本選書流程（新增）
+    if pend.get("type") == "book_selection_step":
+        return _handle_book_selection_step(event, text)
     
     ans = text.strip().upper()
     
     # 取消
     if ans == "N":
-        _PENDING.pop(event.source.user_id, None)
+        _PENDING.pop(user_id, None)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。"))
         return True
     
