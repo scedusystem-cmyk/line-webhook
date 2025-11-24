@@ -333,14 +333,15 @@ def today_str():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 def normalize_phone(s: str) -> Optional[str]:
-    """正規化電話號碼"""
+    """正規化電話號碼（放寬規則：09 開頭 + 10 位數）"""
     digits = re.sub(r"\D+", "", s or "")
-    if len(digits) == 10 and digits.startswith("09"):
+    # 檢查：第一碼是 0，第二碼是 9，總共 10 位數
+    if len(digits) == 10 and digits[0] == "0" and digits[1] == "9":
         return digits
     return None
 
 def parse_kv_lines(text: str) -> Dict[str, str]:
-    """解析 key:value 格式文字"""
+    """解析 key:value 格式文字，支援多種欄位名稱"""
     data = {}
     for line in text.strip().split("\n"):
         line = line.strip()
@@ -352,7 +353,41 @@ def parse_kv_lines(text: str) -> Dict[str, str]:
         elif ":" in line:
             k, v = line.split(":", 1)
             data[k.strip()] = v.strip()
-    return data
+    
+    # 欄位名稱正規化（支援多種寫法）
+    normalized = {}
+    
+    # 姓名欄位
+    for key in ["姓名", "學員姓名", "name", "Name"]:
+        if key in data:
+            normalized["姓名"] = data[key]
+            break
+    
+    # 電話欄位
+    for key in ["電話", "學員電話", "phone", "Phone", "手機"]:
+        if key in data:
+            normalized["電話"] = data[key]
+            break
+    
+    # 地址欄位
+    for key in ["寄送地址", "地址", "address", "Address"]:
+        if key in data:
+            normalized["寄送地址"] = data[key]
+            break
+    
+    # 書籍欄位
+    for key in ["書籍名稱", "書名", "book", "Book", "書籍"]:
+        if key in data:
+            normalized["書籍名稱"] = data[key]
+            break
+    
+    # 備註欄位
+    for key in ["業務備註", "備註", "note", "Note"]:
+        if key in data:
+            normalized["業務備註"] = data[key]
+            break
+    
+    return normalized
 
 # ============================================
 # 書目主檔快取（修復 M1：優化讀取效能）
@@ -621,7 +656,7 @@ def _write_ocr_results(pairs: List[Tuple[str, str]], event) -> str:
 # 寄書功能（含驗證與引導修正）
 # ============================================
 def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
-    """驗證寄書資料，回傳錯誤清單（新功能）"""
+    """驗證寄書資料，只回傳真正有問題的欄位（新功能）"""
     errors = {
         "name": [],
         "phone": [],
@@ -629,25 +664,28 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
         "books": []
     }
     
-    # 驗證姓名
+    # 驗證姓名：有填就好
     name = data.get("name", "").strip()
     if not name:
         errors["name"].append("姓名為必填")
     
-    # 驗證電話
+    # 驗證電話：09 開頭 + 10 位數
     phone_raw = data.get("phone", "").strip()
-    phone = normalize_phone(phone_raw)
-    if not phone:
-        errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 10 碼手機號碼，例：0912345678）")
+    if not phone_raw:
+        errors["phone"].append("電話為必填")
+    else:
+        phone = normalize_phone(phone_raw)
+        if not phone:
+            errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 09 開頭的 10 碼手機號碼）")
     
-    # 驗證地址
+    # 驗證地址：需找到郵遞區號
     address = data.get("address", "").strip()
     if not address:
         errors["address"].append("地址為必填")
     else:
         zip_code = _find_zip_code(address)
         if not zip_code:
-            errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域）")
+            errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
     
     # 驗證書籍
     book_raw = data.get("book", "").strip()
@@ -676,11 +714,11 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
                         "suggestions": []
                     })
     
-    # 移除空錯誤
+    # 移除空錯誤（只回傳真正有問題的）
     return {k: v for k, v in errors.items() if v}
 
 def _format_validation_errors(errors: Dict[str, List]) -> str:
-    """格式化驗證錯誤訊息（新功能）"""
+    """格式化驗證錯誤訊息（只顯示真正有問題的欄位）"""
     lines = ["❌ 發現以下問題：\n"]
     error_num = 1
     
@@ -716,11 +754,20 @@ def _format_validation_errors(errors: Dict[str, List]) -> str:
                 else:
                     lines.append("   → 找不到相似書籍，請使用「#查書名」確認")
                 error_num += 1
+            else:
+                lines.append(f"{error_num}. {err_item}")
+                error_num += 1
     
     lines.append("\n---")
     lines.append("📝 修正方式：")
-    lines.append("• 若書籍有建議選項，請回覆數字選擇（例：1）")
-    lines.append("• 或回覆「重新輸入」重填整筆資料")
+    
+    # 根據錯誤類型給予不同提示
+    if "books" in errors and any(isinstance(e, dict) and e.get("suggestions") for e in errors["books"]):
+        lines.append("• 書籍請回覆數字選擇（例：1）")
+    
+    if "name" in errors or "phone" in errors or "address" in errors:
+        lines.append("• 請重新輸入完整 #寄書 資料（含修正項目）")
+    
     lines.append("• 或回覆「N」取消本次登記")
     
     return "\n".join(lines)
