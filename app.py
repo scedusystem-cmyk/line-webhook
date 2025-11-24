@@ -468,17 +468,29 @@ def _find_book_exact(name: str) -> Optional[str]:
     return None
 
 def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> List[str]:
-    """根據錯誤書名建議選項（新功能）"""
+    """根據錯誤書名建議選項（優先關鍵字搜尋）"""
     books = _load_books()
     wrong_lower = wrong_name.lower().strip()
     
-    # 先檢查模糊比對欄位
+    # 策略 1：關鍵字搜尋（搜尋書名和模糊欄位）
+    keyword_matches = []
+    for book in books:
+        search_text = f"{book['name']} {book['fuzzy']}".lower()
+        if wrong_lower in search_text:
+            keyword_matches.append(book["name"])
+    
+    if keyword_matches:
+        app.logger.info(f"[BOOK] 關鍵字「{wrong_name}」找到 {len(keyword_matches)} 本書")
+        return keyword_matches[:max_results]
+    
+    # 策略 2：模糊比對欄位精確匹配
     for book in books:
         fuzzy_names = [x.strip().lower() for x in book["fuzzy"].split() if x.strip()]
         if wrong_lower in fuzzy_names:
-            return [book["name"]]  # 精確匹配，直接回傳
+            app.logger.info(f"[BOOK] 模糊欄位精確匹配「{wrong_name}」→ {book['name']}")
+            return [book["name"]]
     
-    # 使用 difflib 計算相似度
+    # 策略 3：相似度比對（difflib）
     candidates = []
     for book in books:
         # 比對書名
@@ -504,6 +516,11 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
             unique_results.append(name)
             if len(unique_results) >= max_results:
                 break
+    
+    if unique_results:
+        app.logger.info(f"[BOOK] 相似度匹配「{wrong_name}」找到 {len(unique_results)} 本書")
+    else:
+        app.logger.info(f"[BOOK] 找不到「{wrong_name}」的建議書籍")
     
     return unique_results
 
