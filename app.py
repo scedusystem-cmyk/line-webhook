@@ -929,9 +929,9 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             elif "紀錄ID" in h:
                 row[h["紀錄ID"] - 1] = new_rid
             
-            # 建單日期
+            # 建單日期（使用 yyyy-mm-dd hh:mm 格式）
             if "建單日期" in h:
-                row[h["建單日期"] - 1] = today_str()
+                row[h["建單日期"] - 1] = now_str_min()  # 使用完整時間格式
             elif "建單時間" in h:
                 row[h["建單時間"] - 1] = now_str_min()
             
@@ -965,11 +965,11 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             if "業務備註" in h:
                 row[h["業務備註"] - 1] = biz_note
             
-            # 經手人
+            # 經手人（建單時不填，出貨時才填）
             if "經手人" in h:
-                row[h["經手人"] - 1] = operator
+                row[h["經手人"] - 1] = ""
             elif "已託運-經手人" in h:
-                row[h["已託運-經手人"] - 1] = ""  # 建單時不填
+                row[h["已託運-經手人"] - 1] = ""
             
             # 狀態
             if "寄送狀態" in h:
@@ -981,7 +981,14 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             _safe_append_row(ws, row)
             app.logger.info(f"[ORDER] ✅ 成功建立寄書 {new_rid}: {name} / {book}")
         
-        msg = f"✅ 寄書建立完成\n{new_rid}: {name}\n書籍：{', '.join(final_books)}"
+        msg_lines = ["✅ 寄書建立完成"]
+        msg_lines.append(f"建單日期：{now_str_min()}")
+        msg_lines.append(f"姓名：{name}  |  電話：{phone}")
+        msg_lines.append(f"地址：{address}")
+        msg_lines.append(f"書籍：{', '.join(final_books)}")
+        msg_lines.append("狀態：待處理")
+        
+        msg = "\n".join(msg_lines)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         app.logger.info(f"[ORDER] 訂單建立完成，已回覆使用者")
     except Exception as e:
