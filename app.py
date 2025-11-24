@@ -1,34 +1,30 @@
-# app.py
+# app.py - 優化版
 # ============================================
-# 《寄書＋進銷存 自動化機器人》— 完整版（白名單／只回覆指令／OCR門檻／入庫支援負數／多書展開／取消寄書修補）
-# 架構：Flask + LINE Webhook + Google Sheets +（選）Vision OCR
-#
-# 指令只處理以下：
-#   #我的ID、#寄書、#查寄書、#取消寄書、#刪除寄書、#刪除出書、#取消出書、#出書、#買書、#入庫
-# 其他文字／圖片：一律不處理、不回覆。
-#
-# 模組索引（完整 PY 原則）：
-# - 功能 A：白名單驗證 + 候選名單記錄
-# - 功能 B：寄書建立（#寄書；地址自動補3碼郵遞區號；★★多本書同ID展開多列）
-# - 功能 C：查寄書（電話後碼模糊比對；★★同一ID合併顯示多本）
-# - 功能 D：取消/刪除寄書（★★同一ID全部刪除；需建單人；※排序與已刪除修補）
-# - 功能 E：出書 OCR 啟用（#出書 開啟10分鐘會話，未開啟不回覆圖片）
-# - 功能 F：OCR 解析 + 寫回（R#### ↔ 12碼單號、寄出日期、經手人、狀態）
-# - 功能 G：刪除/取消出書（撤銷已託運欄位，狀態回待處理）
-# - 功能 H：入庫（#買書/#入庫：書名辨識→OK確認→寫入；支援負數＝盤點調整）
-# - 功能 I：#我的ID（不受白名單限制）
-# - 功能 J：只回覆指定指令／其他一律不回覆
+# 修復項目：
+# S1: Vision OCR 正確初始化
+# S2: 移除重複程式碼
+# S3: Sheets 連線錯誤處理
+# H1: 多使用者隔離（user_id 作為 key）
+# H2: 所有 Sheets 操作加入錯誤處理
+# H3: 白名單即時刷新機制
+# M1: 優化 Sheets 讀取效能
+# M2: 統一函式命名
+# M3: 增加關鍵操作日誌
+# 新功能：#查書名（分類查詢）+ 引導修正流程
 # ============================================
 
-import os, json
-print("Loaded JSON:", bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW")))
-
-
-from flask import Flask, request, abort
-import os, re, io, json, difflib, logging, time
+import os
+import re
+import io
+import json
+import difflib
+import logging
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List, Tuple, Any
 
+from flask import Flask, request, abort
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -39,15 +35,37 @@ from linebot.models import (
     TextSendMessage,
 )
 
-# ====== （OCR：使用顯式憑證）======
+# ====== Vision OCR 初始化（修復 S1）======
 _HAS_VISION = False
 _vision_client = None
-try:
-    from google.cloud import vision
-    from google.oauth2 import service_account as gcp_service_account
-    _HAS_VISION = True
-except Exception:
-    _HAS_VISION = False
+
+def _init_vision_client():
+    """正確初始化 Vision API 客戶端"""
+    global _vision_client, _HAS_VISION
+    try:
+        from google.cloud import vision
+        from google.oauth2 import service_account as gcp_service_account
+        
+        json_path = "service_account.json"
+        if os.path.exists(json_path):
+            creds = gcp_service_account.Credentials.from_service_account_file(json_path)
+            _vision_client = vision.ImageAnnotatorClient(credentials=creds)
+            _HAS_VISION = True
+            return
+        
+        sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
+        if sa_json:
+            info = json.loads(sa_json)
+            creds = gcp_service_account.Credentials.from_service_account_info(info)
+            _vision_client = vision.ImageAnnotatorClient(credentials=creds)
+            _HAS_VISION = True
+    except Exception as e:
+        _HAS_VISION = False
+        _vision_client = None
+        print(f"[VISION] 初始化失敗: {e}")
+
+# 啟動時初始化 Vision
+_init_vision_client()
 # ==================================
 
 app = Flask(__name__)
@@ -62,21 +80,23 @@ ZIPREF_SHEET_NAME = os.getenv("ZIPREF_SHEET_NAME", "郵遞區號參照表")
 STOCK_IN_SHEET_NAME = os.getenv("STOCK_IN_SHEET_NAME", "入庫明細")
 HISTORY_SHEET_NAME = os.getenv("HISTORY_SHEET_NAME", "歷史紀錄")
 
-# === 白名單設定（功能 A）===
+# === 白名單設定 ===
 WHITELIST_SHEET_NAME = os.getenv("WHITELIST_SHEET_NAME", "白名單")
 CANDIDATE_SHEET_NAME = os.getenv("CANDIDATE_SHEET_NAME", "候選名單")
-# WHITELIST_MODE: off | log | enforce
 WHITELIST_MODE = os.getenv("WHITELIST_MODE", "enforce").strip().lower()
 ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
 _WHITELIST_CACHE = {"ts": 0.0, "set": set()}
-_WHITELIST_TTL = 300  # 秒
+_WHITELIST_TTL = 300
 
-FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.6"))
+# === 新增常數定義（修復 L1）===
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.7"))
 QUERY_DAYS = int(os.getenv("QUERY_DAYS", "30"))
 PHONE_SUFFIX_MATCH = int(os.getenv("PHONE_SUFFIX_MATCH", "9"))
 WRITE_ZIP_TO_ADDRESS = os.getenv("WRITE_ZIP_TO_ADDRESS", "true").lower() == "true"
 LOG_OCR_RAW = os.getenv("LOG_OCR_RAW", "true").lower() == "true"
 OCR_SESSION_TTL_MIN = int(os.getenv("OCR_SESSION_TTL_MIN", "10"))
+MAX_BOOK_SUGGESTIONS = 3  # 最多建議書籍數量
+MAX_LEFTOVER_ITEMS = 10   # OCR 未配對項目最多顯示數量
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -90,7 +110,13 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 TZ = ZoneInfo("Asia/Taipei")
 
 # ============================================
-# Google Sheets 連線 + 表頭對應
+# 全域狀態管理（修復 H1：使用 user_id 隔離）
+# ============================================
+_PENDING: Dict[str, Dict[str, Any]] = {}  # user_id -> pending_data
+_OCR_SESSIONS: Dict[str, float] = {}  # user_id -> expire_timestamp
+
+# ============================================
+# Google Sheets 連線（修復 S3：加入錯誤處理）
 # ============================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -98,67 +124,145 @@ SCOPES = [
 ]
 
 def _build_gspread_client():
+    """建立 gspread 客戶端"""
     json_path = "service_account.json"
     if os.path.exists(json_path):
         creds = Credentials.from_service_account_file(json_path, scopes=SCOPES)
         return gspread.authorize(creds)
+    
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
     if not sa_json:
-        raise RuntimeError("Missing service account credentials. Provide service_account.json OR env GOOGLE_SERVICE_ACCOUNT_JSON_NEW.")
+        raise RuntimeError("Missing service account credentials.")
+    
     creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
     return gspread.authorize(creds)
 
-gc = _build_gspread_client()
-ss = gc.open_by_key(SHEET_ID)
+def _safe_open_spreadsheet(sheet_id: str):
+    """安全開啟試算表（修復 S3）"""
+    try:
+        gc = _build_gspread_client()
+        return gc.open_by_key(sheet_id)
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 無法開啟試算表 {sheet_id}: {e}")
+        raise RuntimeError(f"無法連線至 Google Sheets: {e}")
+
+# 初始化試算表
+try:
+    ss = _safe_open_spreadsheet(SHEET_ID)
+    app.logger.info(f"[SHEETS] 成功連線至試算表")
+except Exception as e:
+    app.logger.error(f"[SHEETS] 啟動失敗: {e}")
+    ss = None  # 允許服務啟動，但會在操作時報錯
 
 def _ws(name: str):
-    return ss.worksheet(name)
+    """取得工作表（修復 H2：加入錯誤處理）"""
+    try:
+        return ss.worksheet(name)
+    except gspread.WorksheetNotFound:
+        app.logger.error(f"[SHEETS] 工作表不存在: {name}")
+        raise ValueError(f"找不到工作表：{name}")
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 取得工作表失敗 {name}: {e}")
+        raise
 
-def _get_or_create_ws(name: str, headers: list[str]):
-    """若工作表不存在則建立，並補上表頭"""
+def _get_or_create_ws(name: str, headers: list):
+    """取得或建立工作表（修復 H2）"""
     try:
         ws = ss.worksheet(name)
+        return ws
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=name, rows=200, cols=max(10, len(headers)))
-        if headers:
-            ws.update(f"A1:{chr(64+len(headers))}1", [headers])
-    return ws
+        try:
+            ws = ss.add_worksheet(title=name, rows=200, cols=max(10, len(headers)))
+            if headers:
+                ws.update(f"A1:{chr(64+len(headers))}1", [headers])
+            app.logger.info(f"[SHEETS] 已建立工作表: {name}")
+            return ws
+        except Exception as e:
+            app.logger.error(f"[SHEETS] 建立工作表失敗 {name}: {e}")
+            raise
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 取得工作表失敗 {name}: {e}")
+        raise
 
 def _get_header_map(ws):
-    header = ws.row_values(1)
-    hmap = {}
-    for idx, title in enumerate(header, start=1):
-        t = str(title).strip()
-        if t:
-            hmap[t] = idx
-    return hmap
+    """取得表頭對應（修復 H2）"""
+    try:
+        header = ws.row_values(1)
+        hmap = {}
+        for idx, title in enumerate(header, start=1):
+            t = str(title).strip()
+            if t:
+                hmap[t] = idx
+        return hmap
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 取得表頭失敗: {e}")
+        return {}
 
 def _col_idx(hmap, key, default_idx):
+    """取得欄位索引"""
     return hmap.get(key, default_idx)
 
+def _safe_update_cell(ws, row: int, col: int, value: Any):
+    """安全更新儲存格（修復 H2 + M3）"""
+    try:
+        ws.update_cell(row, col, value)
+        app.logger.info(f"[SHEETS] 更新 {ws.title} R{row}C{col} = {value}")
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 更新失敗 R{row}C{col}: {e}")
+        raise
+
+def _safe_append_row(ws, row_data: list):
+    """安全新增列（修復 H2 + M3）"""
+    try:
+        ws.append_row(row_data, value_input_option="USER_ENTERED")
+        app.logger.info(f"[SHEETS] 新增列至 {ws.title}: {row_data[:3]}...")
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 新增列失敗: {e}")
+        raise
+
+def _safe_append_rows(ws, rows_data: list):
+    """安全批次新增列（修復 H2 + M3）"""
+    try:
+        ws.append_rows(rows_data, value_input_option="USER_ENTERED")
+        app.logger.info(f"[SHEETS] 批次新增 {len(rows_data)} 列至 {ws.title}")
+    except Exception as e:
+        app.logger.error(f"[SHEETS] 批次新增失敗: {e}")
+        raise
+
 # ============================================
-# 功能 A：白名單（user_id 驗證 + 候選名單記錄）
+# 白名單功能（修復 H3：即時刷新）
 # ============================================
 def _truthy(v) -> bool:
+    """判斷值是否為真"""
     s = str(v).strip().lower()
-    return s in ("1","true","yes","y","t","啟用","是","enabled","on")
+    return s in ("1", "true", "yes", "y", "t", "啟用", "是", "enabled", "on")
 
-def _load_whitelist(force: bool = False) -> set[str]:
-    """回傳 enabled 的 user_id set，快取 5 分鐘"""
+def _load_whitelist(force: bool = False) -> set:
+    """載入白名單（修復 H3：支援強制刷新）"""
     now = time.time()
     if (not force) and _WHITELIST_CACHE["set"] and (now - _WHITELIST_CACHE["ts"] < _WHITELIST_TTL):
         return _WHITELIST_CACHE["set"]
-    ws = _get_or_create_ws(WHITELIST_SHEET_NAME, ["user_id","name","enabled"])
-    rows = ws.get_all_records()
-    enabled = {str(r.get("user_id","")).strip() for r in rows if str(r.get("user_id","")).strip() and _truthy(r.get("enabled", "1"))}
-    _WHITELIST_CACHE["set"] = enabled
-    _WHITELIST_CACHE["ts"] = now
-    return enabled
+    
+    try:
+        ws = _get_or_create_ws(WHITELIST_SHEET_NAME, ["user_id", "name", "enabled"])
+        rows = ws.get_all_records()
+        enabled = {
+            str(r.get("user_id", "")).strip() 
+            for r in rows 
+            if str(r.get("user_id", "")).strip() and _truthy(r.get("enabled", "1"))
+        }
+        _WHITELIST_CACHE["set"] = enabled
+        _WHITELIST_CACHE["ts"] = now
+        app.logger.info(f"[WHITELIST] 已載入 {len(enabled)} 個授權使用者")
+        return enabled
+    except Exception as e:
+        app.logger.error(f"[WHITELIST] 載入失敗: {e}")
+        return _WHITELIST_CACHE["set"]  # 回傳舊快取
 
 def _log_candidate(user_id: str, name: str):
-    """自動記錄到候選名單（若已存在只更新 last_seen）"""
+    """記錄候選名單（修復 H2）"""
     try:
-        ws = _get_or_create_ws(CANDIDATE_SHEET_NAME, ["user_id","name","first_seen","last_seen"])
+        ws = _get_or_create_ws(CANDIDATE_SHEET_NAME, ["user_id", "name", "first_seen", "last_seen"])
         all_vals = ws.get_all_values()
         h = _get_header_map(ws)
         idx_uid = _col_idx(h, "user_id", 1)
@@ -168,25 +272,22 @@ def _log_candidate(user_id: str, name: str):
 
         exists_row = None
         for i, r in enumerate(all_vals[1:], start=2):
-            if (len(r) >= idx_uid) and r[idx_uid-1] == user_id:
+            if (len(r) >= idx_uid) and r[idx_uid - 1] == user_id:
                 exists_row = i
                 break
 
         now_s = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
         if exists_row:
             if name:
-                try:
-                    ws.update_cell(exists_row, idx_name, name)
-                except Exception:
-                    pass
-            ws.update_cell(exists_row, idx_last, now_s)
+                _safe_update_cell(ws, exists_row, idx_name, name)
+            _safe_update_cell(ws, exists_row, idx_last, now_s)
         else:
-            ws.append_row([user_id, name, now_s, now_s], value_input_option="USER_ENTERED")
+            _safe_append_row(ws, [user_id, name, now_s, now_s])
     except Exception as e:
-        app.logger.info(f"[CANDIDATE] log failed: {e}")
+        app.logger.warning(f"[CANDIDATE] 記錄失敗: {e}")
 
 def _ensure_authorized(event, scope: str = "*") -> bool:
-    """根據 WHITELIST_MODE 判斷是否放行；未授權時回覆說明並附使用者ID"""
+    """驗證授權（修復 M3：增加日誌）"""
     try:
         uid = getattr(event.source, "user_id", "")
         profile = line_bot_api.get_profile(uid)
@@ -195,20 +296,23 @@ def _ensure_authorized(event, scope: str = "*") -> bool:
         uid = getattr(event.source, "user_id", "")
         display_name = "LINE使用者"
 
-    # 候選名單永遠記錄
     if uid:
         _log_candidate(uid, display_name)
 
     if uid in ADMIN_USER_IDS:
+        app.logger.info(f"[AUTH] 管理員通過: {uid}")
         return True
+    
     if WHITELIST_MODE in ("off", "log"):
-        return True  # 允許
+        app.logger.info(f"[AUTH] 白名單模式 {WHITELIST_MODE}，允許: {uid}")
+        return True
 
     allowed = _load_whitelist()
     if uid in allowed:
+        app.logger.info(f"[AUTH] 白名單通過: {uid}")
         return True
 
-    # 未授權 → 文字才提示；圖片不回覆
+    app.logger.warning(f"[AUTH] 未授權: {uid}")
     if scope == "text":
         msg = f"❌ 尚未授權使用。\n請將此 ID 提供給管理員開通：\n{uid}\n\n（提示：傳「#我的ID」也能取得這串 ID）"
         try:
@@ -218,1487 +322,932 @@ def _ensure_authorized(event, scope: str = "*") -> bool:
     return False
 
 # ============================================
-# 工具與格式化
+# 工具函式
 # ============================================
 def now_str_min():
+    """目前時間字串（分鐘）"""
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
 def today_str():
+    """今日日期字串"""
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
-def normalize_phone(s: str):
+def normalize_phone(s: str) -> Optional[str]:
+    """正規化電話號碼"""
     digits = re.sub(r"\D+", "", s or "")
     if len(digits) == 10 and digits.startswith("09"):
         return digits
     return None
 
-def parse_kv_lines(text: str):
+def parse_kv_lines(text: str) -> Dict[str, str]:
+    """解析 key:value 格式文字"""
     data = {}
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for ln in lines:
-        if ln.startswith("#"):
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
             continue
-        if "：" in ln:
-            k, v = ln.split("：", 1)
-        elif ":" in ln:
-            k, v = ln.split(":", 1)
-        else:
-            k, v = "_free_", ln
-        k = k.strip()
-        v = v.strip()
-        data.setdefault(k, []).append(v)
+        if "：" in line:
+            k, v = line.split("：", 1)
+            data[k.strip()] = v.strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            data[k.strip()] = v.strip()
     return data
 
-def col_to_letter(col: int) -> str:
-    s = ""
-    while col > 0:
-        col, r = divmod(col - 1, 26)
-        s = chr(r + 65) + s
-    return s
-
 # ============================================
-# 功能 X：原始資料 → #寄書 格式化（for #整理寄書）
+# 書目主檔快取（修復 M1：優化讀取效能）
 # ============================================
-def _parse_raw_to_order(text: str):
-    """
-    輸入：多行原始資料（姓名/電話/書名 + 地址 + 備註）
-    輸出：dict（name, phone, address, book_raw, biz_note）
-    """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return None, ["❌ 沒有讀到任何內容"]
+_BOOK_CACHE = {"ts": 0.0, "books": []}
+_BOOK_CACHE_TTL = 600  # 10 分鐘
 
-    # 預設：第一行（姓名 + 電話 + 書名）
-    first = lines[0]
-    rest = lines[1:]
+def _load_books(force: bool = False) -> List[Dict[str, Any]]:
+    """載入書目主檔（含快取機制，修復 M1）"""
+    now = time.time()
+    if (not force) and _BOOK_CACHE["books"] and (now - _BOOK_CACHE["ts"] < _BOOK_CACHE_TTL):
+        return _BOOK_CACHE["books"]
+    
+    try:
+        ws = _ws(BOOK_MASTER_SHEET_NAME)
+        rows = ws.get_all_records()
+        books = []
+        for r in rows:
+            if str(r.get("是否啟用", "")).strip() == "使用中":
+                name = str(r.get("書籍名稱", "")).strip()
+                lang = str(r.get("語別", "")).strip()
+                fuzzy = str(r.get("模糊比對書名", "")).strip()
+                stock = r.get("現有庫存", 0)
+                if name:
+                    books.append({
+                        "name": name,
+                        "lang": lang,
+                        "fuzzy": fuzzy,
+                        "stock": stock
+                    })
+        _BOOK_CACHE["books"] = books
+        _BOOK_CACHE["ts"] = now
+        app.logger.info(f"[BOOK] 已載入 {len(books)} 本書籍")
+        return books
+    except Exception as e:
+        app.logger.error(f"[BOOK] 載入失敗: {e}")
+        return _BOOK_CACHE["books"]  # 回傳舊快取
 
-    # 電話
-    phone = None
-    m = re.search(r"(09\d{8})", first)
-    if m:
-        phone = m.group(1)
-        first = first.replace(phone, "").strip()
+def _search_books_by_keyword(keyword: str) -> List[Dict[str, Any]]:
+    """根據關鍵字搜尋書籍（新功能）"""
+    books = _load_books()
+    keyword_lower = keyword.lower()
+    results = []
+    
+    for book in books:
+        # 搜尋書名、語別、模糊比對欄位
+        search_text = f"{book['name']} {book['lang']} {book['fuzzy']}".lower()
+        if keyword_lower in search_text:
+            results.append(book)
+    
+    app.logger.info(f"[BOOK] 搜尋「{keyword}」找到 {len(results)} 本")
+    return results
 
-    # 姓名 + 書名（電話去掉後）
-    tokens = first.split()
-    name = tokens[0] if tokens else None
-    book_raw = " ".join(tokens[1:]) if len(tokens) > 1 else None
-
-    # 地址（取剩下第一行）
-    address, notes = None, []
-    if rest:
-        address = rest[0].replace(" ", "")
-        if len(rest) > 1:
-            notes = rest[1:]
-
-    return {
-        "name": name,
-        "phone": phone,
-        "address": address,
-        "book_raw": book_raw,
-        "biz_note": " / ".join(notes)
-    }, []
-
-# ============================================
-# 寄送方式偵測（只偵測便利商店；其餘交由後續規則）
-# ============================================
-def detect_delivery_method(text: str):
-    s = (text or "").lower().replace("—", "-").replace("／", "/")
-    if any(k in s for k in ["7-11","7/11","7／11","7–11","711","小七"]): return "7-11"
-    if "全家" in s or "family" in s: return "全家"
-    if "萊爾富" in s or "hi-life" in s or "hilife" in s: return "萊爾富"
-    if "ok" in s or "ok超商" in s: return "OK"
+def _find_book_exact(name: str) -> Optional[str]:
+    """精確查找書名"""
+    books = _load_books()
+    name_lower = name.lower().strip()
+    
+    # 1. 精確比對書名
+    for book in books:
+        if book["name"].lower() == name_lower:
+            return book["name"]
+    
+    # 2. 模糊比對欄位
+    for book in books:
+        fuzzy_names = [x.strip().lower() for x in book["fuzzy"].split() if x.strip()]
+        if name_lower in fuzzy_names:
+            return book["name"]
+    
     return None
 
+def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> List[str]:
+    """根據錯誤書名建議選項（新功能）"""
+    books = _load_books()
+    wrong_lower = wrong_name.lower().strip()
+    
+    # 先檢查模糊比對欄位
+    for book in books:
+        fuzzy_names = [x.strip().lower() for x in book["fuzzy"].split() if x.strip()]
+        if wrong_lower in fuzzy_names:
+            return [book["name"]]  # 精確匹配，直接回傳
+    
+    # 使用 difflib 計算相似度
+    candidates = []
+    for book in books:
+        # 比對書名
+        ratio = difflib.SequenceMatcher(None, wrong_lower, book["name"].lower()).ratio()
+        candidates.append((ratio, book["name"]))
+        
+        # 比對模糊欄位
+        for fuzzy in book["fuzzy"].split():
+            if fuzzy.strip():
+                ratio2 = difflib.SequenceMatcher(None, wrong_lower, fuzzy.strip().lower()).ratio()
+                candidates.append((ratio2, book["name"]))
+    
+    # 排序並去重
+    candidates = sorted(set(candidates), key=lambda x: x[0], reverse=True)
+    results = [name for score, name in candidates if score >= FUZZY_THRESHOLD]
+    
+    # 去重並限制數量
+    seen = set()
+    unique_results = []
+    for name in results:
+        if name not in seen:
+            seen.add(name)
+            unique_results.append(name)
+            if len(unique_results) >= max_results:
+                break
+    
+    return unique_results
+
 # ============================================
-# 郵遞區號查找（前置）
+# 郵遞區號查詢（修復 H2）
 # ============================================
-_zip_cache = None
-def _load_zipref():
-    global _zip_cache
-    if _zip_cache is not None:
-        return _zip_cache
+def _find_zip_code(address: str) -> Optional[str]:
+    """查詢郵遞區號（修復 H2）"""
     try:
         ws = _ws(ZIPREF_SHEET_NAME)
-        rows = ws.get_all_values()
-        header = rows[0] if rows else []
-        zi, ai = None, None
-        for i, name in enumerate(header):
-            n = str(name).strip()
-            if zi is None and re.search(r"郵遞區號|郵遞|zip|ZIP", n, re.I): zi = i
-            if ai is None and re.search(r"地址|路|區|鄉|鎮|村|里|段|巷|市|縣", n): ai = i
-        if zi is None or ai is None:
-            zi, ai = 1, 0
-        pairs = []
-        for r in rows[1:]:
-            try:
-                prefix = (r[ai] if ai < len(r) else "").strip()
-                z = (r[zi] if zi < len(r) else "").strip()
-                if prefix and re.fullmatch(r"\d{3}(\d{2})?", z):
-                    pairs.append((prefix, z))
-            except Exception:
-                continue
-        pairs.sort(key=lambda x: len(x[0]), reverse=True)
-        _zip_cache = pairs
-        return _zip_cache
+        rows = ws.get_all_records()
+        
+        for row in rows:
+            district = str(row.get("區域", "")).strip()
+            zip_code = str(row.get("郵遞區號", "")).strip()
+            if district and district in address:
+                app.logger.info(f"[ZIP] 找到郵遞區號 {zip_code} for {district}")
+                return zip_code
+        
+        app.logger.warning(f"[ZIP] 找不到郵遞區號: {address}")
+        return None
     except Exception as e:
-        app.logger.info(f"[ZIPREF] Load failed: {e}")
-        _zip_cache = []
-        return _zip_cache
-
-def lookup_zip(address: str):
-    if not address:
-        return None
-    pairs = _load_zipref()  # [("中正區","100"), ...]
-    a = address.strip()
-    for prefix, z in pairs:
-        if prefix in a:
-            return z
-    return None
-
-# ============================================
-# 書名比對（共用）
-# ============================================
-
-def _normalize_for_match(s: str) -> str:
-    """比對用字串正規化：小寫、去空白、去標點"""
-    return re.sub(r"[\s\W_]+", "", (s or "").lower())
-
-def _split_alias_field(field: str):
-    """把「模糊比對書名」欄位依常見分隔符拆開，並做正規化"""
-    if not field:
-        return []
-    parts = re.split(r"[、,;|／/ ]+", field)
-    return [{"raw": p.strip(), "norm": _normalize_for_match(p)} for p in parts if p.strip()]
-
-BOOK_INDEX_CACHE = None
-
-BOOK_INDEX_CACHE = None
-
-def build_book_index(ws_books):
-    """從〈書目主檔〉建立比對索引：每本書至少含『完整書名』這個 alias；過濾純數字/太短 alias。"""
-    data = ws_books.get_all_values()
-    if not data:
-        return []
-
-    header = {name: idx for idx, name in enumerate(data[0])}
-    def col(name, default=None): return header.get(name, default)
-
-    col_title = col("書籍名稱")
-    col_alias = col("模糊比對書名")
-    col_on    = col("是否啟用")
-
-    index = []
-    for row in data[1:]:
-        title = (row[col_title] if col_title is not None and col_title < len(row) else "").strip()
-        if not title:
-            continue
-        if col_on is not None and (row[col_on] if col_on < len(row) else "").strip() not in ("使用中","啟用","enabled","1","true","TRUE"):
-            continue
-
-        aliases = []
-        # 1) 先放入「完整書名」這一個 alias（不拆詞）
-        aliases.append({"raw": title, "norm": _normalize_for_match(title)})
-
-        # 2) 再加入欄位中的自訂別名（這個才拆分）
-        alias_field = row[col_alias] if col_alias is not None and col_alias < len(row) else ""
-        if alias_field:
-            for a in re.split(r"[、,;|／/ ]+", alias_field):
-                a = a.strip()
-                if not a:
-                    continue
-                norm = _normalize_for_match(a)
-                # 過濾：純數字、長度過短（<2）
-                if not norm or norm.isdigit() or len(norm) < 2:
-                    continue
-                aliases.append({"raw": a, "norm": norm})
-
-        # 去重
-        seen = set()
-        uniq = []
-        for a in aliases:
-            if a["norm"] in seen:
-                continue
-            seen.add(a["norm"])
-            uniq.append(a)
-
-        # 最長優先，避免「Try N」壓掉「Try N5」
-        uniq.sort(key=lambda a: len(a["norm"]), reverse=True)
-
-        index.append({"title": title, "aliases": uniq})
-    return index
-
-def get_book_index():
-    global BOOK_INDEX_CACHE
-    if BOOK_INDEX_CACHE is None:
-        ws_books = _ws(BOOK_MASTER_SHEET_NAME)
-        BOOK_INDEX_CACHE = build_book_index(ws_books)
-    return BOOK_INDEX_CACHE
-
-
-def resolve_book_name(user_input: str):
-    """輸入一段文字，回傳：(正式書名, 比對方式, 候選清單)"""
-    src_norm = _normalize_for_match(user_input)
-    if not src_norm:
-        return (None, "notfound", [])
-
-    # 🔑 抓出輸入裡的數字
-    digits = re.findall(r"\d+", user_input)
-
-    books = get_book_index()
-
-    # 1) 完全相等
-    for b in books:
-        for alias in b["aliases"]:
-            if src_norm == alias["norm"]:
-                return (b["title"], "exact", None)
-
-    # 2) 若輸入含數字 → 僅允許同樣數字的書進來
-    narrowed_books = books
-    if digits:
-        narrowed_books = []
-        for b in books:
-            aliases_norm = [a["norm"] for a in b["aliases"]]
-            if any(any(d == dd for dd in re.findall(r"\d+", a)) for d in digits for a in aliases_norm):
-                narrowed_books.append(b)
-        if not narrowed_books:
-            return (None, "notfound", [])
-
-    # 3) 完整包含（至少4碼）
-    for b in narrowed_books:
-        for alias in b["aliases"]:
-            if len(alias["norm"]) >= 4 and alias["norm"] in src_norm:
-                return (b["title"], "contain", None)
-
-    # 4) Fuzzy 比對（過濾過短 alias）
-    universe, reverse_map = [], {}
-    for b in narrowed_books:
-        for alias in b["aliases"]:
-            norm = alias["norm"]
-            if not norm:
-                continue
-            if len(norm) < 3 and not re.match(r"^[a-z]\d$", norm):
-                continue
-            universe.append(norm)
-            reverse_map[norm] = b["title"]
-
-    matches = difflib.get_close_matches(src_norm, universe, n=5, cutoff=0.8)
-    if not matches:
-        return (None, "notfound", [])
-
-    formal = []
-    for m in matches:
-        fm = reverse_map.get(m)
-        if fm and fm not in formal:
-            formal.append(fm)
-
-    if len(formal) == 1:
-        return (formal[0], "fuzzy", None)
-
-    return (None, "ambiguous", formal)
-
-
-# ========== 抽書名（整句最長優先＋數字相符） ==========
-# === [PATCH] 備註清理強化（Let's / Lets、空白、連字號都能吃；殘渣自動忽略） ===
-def _alias_relaxed_regex(alias_raw: str) -> re.Pattern:
-    """
-    依據「原始別名」生成一個寬鬆 regex：
-    - ' / ’ / ` 視為「可有可無」
-    - 空白／斜線／連字號 視為「0~多個分隔」
-    - 其餘字元嚴格逐字比對（不分大小寫）
-    目標：讓 "Let's Go 3" 能吃到 "Lets Go 3"、"Lets-Go-3"、"LetsGo3" 等變體
-    """
-    buf = []
-    for ch in alias_raw:
-        if ch in ("'", "’", "`"):
-            buf.append(r"(?:['’`]*)")  # 可有可無
-        elif ch.isspace() or ch in "/／|-–—_":
-            buf.append(r"[\s/／\-\–\—_]*")  # 0~多個分隔
-        else:
-            buf.append(re.escape(ch))
-    pat = "".join(buf)
-    try:
-        return re.compile(pat, flags=re.IGNORECASE)
-    except Exception:
-        # 萬一組字失敗，就退回精確字串
-        return re.compile(re.escape(alias_raw), flags=re.IGNORECASE)
-
-def _cleanup_note(note: str) -> str:
-    """
-    備註殘渣過濾規則：
-    - 去手機號、引號、邊界符號、重複空白
-    - 單一英文字母/數字、總長 <2、純 ASCII 且各 token <3 → 視為無效
-    """
-    if not note:
-        return ""
-    # 再保險一次去電話
-    note = re.sub(r"09\d{8}", " ", note)
-    # 去掉引號/符號雜訊
-    note = re.sub(r'[\"\'’`]+', "", note)
-    # 合併空白
-    note = re.sub(r"\s+", " ", note).strip()
-    # 刪邊界分隔符
-    note = note.strip(" ,.;:|/\\-—–_")
-    # 極短／單字母數字 → 丟
-    if not note or len(note) <= 1:
-        return ""
-    if re.fullmatch(r"[A-Za-z0-9]{1,2}", note):
-        return ""
-    # 去掉孤立單字母（e.g., 's'）
-    note = re.sub(r"\b[a-zA-Z]\b", " ", note)
-    note = re.sub(r"\s+", " ", note).strip()
-    if not note:
-        return ""
-    # 若純 ASCII，且每個 token 都 <3 → 丟
-    if re.fullmatch(r"[A-Za-z0-9\s]+", note):
-        toks = [t for t in note.split() if t]
-        if not any(len(t) >= 3 for t in toks):
-            return ""
-    return note
-
-# ========== 抽書名（整句最長優先＋數字相符） ==========
-def _extract_books_and_note_from_text(user_text: str):
-    """
-    從一句話中抽出多本書與備註：
-      - 使用最長優先別名；若輸入帶數字，alias 也需含相同數字（但純數字 alias 一律忽略）
-      - 短代號（如 n5/lg6）必須『原樣』出現在輸入
-      - 命中後用「彈性別名 regex」先清掉整段，再用 tokens 補刀
-      - 最後套用備註殘渣過濾（例如只剩 's' 這種直接視為空）
-    回傳：(books, note)
-    """
-    raw = (user_text or "").strip()
-    if not raw:
-        return [], ""
-
-    def ascii_compact(s: str) -> str:
-        return re.sub(r"[^A-Za-z0-9]+", "", (s or "").lower())
-
-    input_norm  = _normalize_for_match(raw)   # 小寫 去標點/空白
-    input_ascii = ascii_compact(raw)          # 只留 A-Z0-9
-    digits_in_input = set(re.findall(r"\d+", raw))
-
-    # 攤平 alias（長到短）
-    flat = []
-    for b in get_book_index():
-        for a in b["aliases"]:
-            flat.append((b["title"], a["raw"], a["norm"]))
-    flat.sort(key=lambda t: len(t[2] or ""), reverse=True)
-
-    books, cleanup_token_sets, cleanup_patterns, seen_titles = [], [], [], set()
-
-    for title, araw, anorm in flat:
-        if title in seen_titles or not anorm:
-            continue
-
-        # 忽略純數字 alias
-        if anorm.isdigit():
-            continue
-
-        # 若輸入含數字 → alias 也要含相同數字（至少一個）
-        if digits_in_input:
-            alias_digits = set(re.findall(r"\d+", araw))
-            if not alias_digits.intersection(digits_in_input):
-                continue
-
-        # 命中條件（兩種）：
-        hit = False
-        if anorm in input_norm:
-            hit = True
-        else:
-            # 短代號（如 n5, lg6）：必須『原樣』在輸入的 ascii 裡
-            if re.fullmatch(r"[a-z]{1,3}\d{1,2}", anorm) and anorm in input_ascii:
-                hit = True
-
-        if not hit:
-            continue
-
-        # 命中：收書名 + 準備兩階段清理（先整段、後 token）
-        books.append(title)
-        seen_titles.add(title)
-
-        # ① 整段清理（彈性 regex：吃掉 Lets / Let's / 空白 / 連字號）
-        cleanup_patterns.append(_alias_relaxed_regex(araw))
-
-        # ② token 清理（英文片段>=2、數字、連成一段的英文字也清）
-        toks = set()
-        toks.update(re.findall(r"[A-Za-z]{2,}", araw))
-        toks.update(re.findall(r"\d+", araw))
-        compact_alpha = "".join(re.findall(r"[A-Za-z]+", araw)).lower()
-        if len(compact_alpha) >= 3:
-            toks.add(compact_alpha)
-        cleanup_token_sets.append(toks)
-
-    # 從原句依序清理：先整段（彈性）、再 token（補刀）
-    note = raw
-    for rx in cleanup_patterns:
-        note = rx.sub(" ", note)  # 先把「完整別名變體」吃掉
-    for tset in cleanup_token_sets:
-        for tok in sorted(tset, key=len, reverse=True):
-            note = re.sub(tok, " ", note, flags=re.IGNORECASE)
-
-    # 去掉電話、收尾空白與殘渣
-    note = re.sub(r"09\d{8}", " ", note)
-    note = re.sub(r"\s+", " ", note).strip()
-
-    # 最終備註過濾
-    note = _cleanup_note(note)
-
-    return books, note
-
-# ============================================
-# Vision Client（顯式憑證建立）
-# ============================================
-def _build_vision_client():
-    global _HAS_VISION, _vision_client
-    if not _HAS_VISION:
-        return None
-    try:
-        json_path = "service_account.json"
-        creds = None
-        if os.path.exists(json_path):
-            creds = gcp_service_account.Credentials.from_service_account_file(json_path)
-        else:
-            sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_NEW", "")
-            if not sa_json:
-                raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON_NEW for Vision client.")
-            creds = gcp_service_account.Credentials.from_service_account_info(json.loads(sa_json))
-        _vision_client = vision.ImageAnnotatorClient(credentials=creds)
-        return _vision_client
-    except Exception as e:
-        app.logger.info(f"[VISION] init failed: {e}")
-        _HAS_VISION = False
+        app.logger.error(f"[ZIP] 查詢失敗: {e}")
         return None
 
-_vision_client = _build_vision_client()
-
 # ============================================
-# 建檔輔助（寄書）
-# ============================================
-def _gen_next_record_id(ws, header_map):
-    colA = _col_idx(header_map, "紀錄ID", 1)
-    values = ws.col_values(colA)[1:]
-    max_no = 0
-    for v in values:
-        m = re.fullmatch(r"R(\d{4})", str(v).strip())
-        if m:
-            n = int(m.group(1))
-            if n > max_no:
-                max_no = n
-    return f"R{max_no+1:04d}"
-
-def _build_insert_row(ws, data, who_display_name, *, force_rid=None, force_book=None):
-    """
-    欄位：A紀錄ID B建單日期 C建單人 D學員姓名 E學員電話 F寄送地址
-          G書籍名稱 H業務備註 I寄送方式 J寄出日期 K託運單號 L經手人 M寄送狀態
-    """
-    hmap = _get_header_map(ws)
-    header_len = len(ws.row_values(1))
-    idxA = _col_idx(hmap, "紀錄ID", 1)
-    idxB = _col_idx(hmap, "建單日期", 2)
-    idxC = _col_idx(hmap, "建單人", 3)
-    idxD = _col_idx(hmap, "學員姓名", 4)
-    idxE = _col_idx(hmap, "學員電話", 5)
-    idxF = _col_idx(hmap, "寄送地址", 6)
-    idxG = _col_idx(hmap, "書籍名稱", 7)
-    idxH = _col_idx(hmap, "業務備註", 8)
-    idxI = _col_idx(hmap, "寄送方式", 9)
-    idxJ = _col_idx(hmap, "寄出日期", 10)
-    idxK = _col_idx(hmap, "託運單號", 11)
-    idxL = _col_idx(hmap, "經手人", 12)
-    idxM = _col_idx(hmap, "寄送狀態", 13)
-
-    total_cols = max(header_len, idxM)
-    row = [""] * total_cols
-
-    if force_rid:
-        rid = force_rid
-    else:
-        rid = _gen_next_record_id(ws, hmap)
-
-    row[idxA-1] = rid
-    row[idxB-1] = now_str_min()
-    row[idxC-1] = who_display_name or "LINE使用者"
-    row[idxD-1] = data.get("name","")
-    phone = data.get("phone","")
-    row[idxE-1] = f"'{phone}" if phone else ""
-    address = data.get("address","")
-
-    # ✅ 一律嘗試補郵遞區號（若能對上且目前沒3碼開頭）
-    if WRITE_ZIP_TO_ADDRESS and address:
-        z = lookup_zip(address)
-        if z and not re.match(r"^\d{3}", address):
-            address = f"{z}{address}"
-    row[idxF-1] = address
-
-    # ★★ 允許覆寫書名（多本展開）
-    row[idxG-1] = force_book if force_book else data.get("book_formal","")
-    row[idxH-1] = data.get("biz_note","")
-    row[idxI-1] = data.get("delivery") or ""
-    row[idxJ-1] = ""
-    row[idxK-1] = ""
-    row[idxL-1] = ""
-    row[idxM-1] = "待處理"
-
-    return row, {"rid": rid}
-
-# ★ 插入第2列不繼承格式
-def _insert_row_values_no_inherit(ws, row_values, index=2):
-    ss.batch_update({
-        "requests": [{
-            "insertDimension": {
-                "range": {
-                    "sheetId": ws.id,
-                    "dimension": "ROWS",
-                    "startIndex": index - 1,
-                    "endIndex": index
-                },
-                "inheritFromBefore": False
-            }
-        }]
-    })
-    header_len = len(ws.row_values(1)) or 13
-    last_col = max(header_len, len(row_values))
-    if len(row_values) < last_col:
-        row_values = row_values + [""] * (last_col - len(row_values))
-    rng = f"A{index}:{col_to_letter(last_col)}{index}"
-    ws.update(rng, [row_values], value_input_option="USER_ENTERED")
-
-# ============================================
-# 功能 X：原始資料 → #寄書 格式化（for #整理寄書）
-# 使用整句最長優先比對 → 先抓書名，剩下變備註
-# ============================================
-def _parse_raw_to_order(text: str):
-    # 先把引號/全形空白處理乾淨
-    text = (text or "").replace("\u3000", " ").strip()
-    text = text.strip('"').strip("'")
-    lines = [ln.strip().strip('"').strip("'") for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return None, ["❌ 沒有讀到任何內容"]
-
-    # 電話（全文抓 09 開頭 10 碼）
-    joined = " ".join(lines)
-    m_phone = re.search(r"(09\d{8})", joined)
-    phone = m_phone.group(1) if m_phone else None
-    if phone:
-        lines = [ln.replace(phone, "").strip() for ln in lines]
-
-    # 地址：從第2行開始找常見地名/路字眼
-    addr_idx, address = None, None
-    for i, ln in enumerate(lines[1:], start=1):
-        if re.search(r"(市|縣).*(區|鄉|鎮|市)|路|街|段|巷|弄|號|樓", ln):
-            address, addr_idx = ln.replace(" ", ""), i
-            break
-
-    # 姓名：第一行前段的非數字連續字元
-    first = lines[0]
-    m_name = re.match(r"^[^\d\s]+", first)
-    name = m_name.group(0) if m_name else None
-    rest_first = first[len(name):].strip() if name else first
-
-    # 準備一串「用來抽書名」的文字（不要再拆 token）
-    other_lines = [ln for idx, ln in enumerate(lines[1:], start=1) if idx != addr_idx]
-    candidate_text = " ".join([rest_first] + other_lines)
-
-    # ★ 這裡用整句最長優先去抽書名，剩餘變備註
-    books, note = _extract_books_and_note_from_text(candidate_text)
-
-    return {
-        "name": name,
-        "phone": phone,
-        "address": address,
-        "book_list": books,
-        "book_raw": "、".join(books) if books else "",
-        "biz_note": note
-    }, []
-
-
-# ============================================
-# 功能 B：解析＋建立寄書（#寄書）
-# （★★ 多本書支援：同一ID展開多列；寄送方式也檢查地址）
-# ============================================
-_BOOK_SPLIT_RE = re.compile(r"[、，,／/]+")
-
-def _parse_new_order_text(raw_text: str):
-    data = parse_kv_lines(raw_text)
-
-    # 1) 姓名
-    name = None
-    for k in list(data.keys()):
-        if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
-            name = "、".join(data.pop(k))
-            break
-
-    # 2) 電話
-    phone = None
-    for k in list(data.keys()):
-        if "電話" in k:
-            for v in data.pop(k):
-                p = normalize_phone(v)
-                if p:
-                    phone = p
-                    break
-            break
-
-    # 3) 地址
-    address = None
-    for k in list(data.keys()):
-        if any(x in k for x in ["寄送地址","地址","收件地址","配送地址"]):
-            address = " ".join(data.pop(k))
-            address = address.replace(" ", "")
-            break
-
-    # 4) 書名（先整串）
-    book_raw = None
-    for k in list(data.keys()):
-        if any(x in k for x in ["書","書名","教材","書籍名稱"]):
-            book_raw = " ".join(data.pop(k)).strip()
-            break
-
-    # 合併剩餘文字以利偵測便利商店
-    merged_text = "\n".join(sum(data.values(), []))
-
-    # ★★ 寄送方式檢測擴大到「剩餘文字 + 地址」
-    delivery = detect_delivery_method(merged_text + " " + (address or ""))
-
-    # 若未偵測到便利商店、但有地址 → 寄送方式=「便利帶」
-    if not delivery and address:
-        delivery = "便利帶"
-
-    # 其他文字 → 業務備註
-    others = []
-    for k, arr in data.items():
-        for v in arr:
-            if k != "_free_":
-                others.append(f"{k}：{v}")
-            else:
-                others.append(v)
-    biz_note = " / ".join([x for x in others if x.strip()])
-
-    # 驗證（若非便利商店需地址）
-    errors = []
-    if not name: errors.append("缺少【姓名】")
-    if not phone: errors.append("電話格式錯誤（需 09 開頭 10 碼）")
-    if not book_raw: errors.append("缺少【書名】")
-    if delivery not in ["7-11","全家","OK","萊爾富"] and not address:
-        errors.append("缺少【寄送地址】（非超商必填）")
-
-    return {
-        "name": name,
-        "phone": phone,
-        "address": address,
-        "book_raw": book_raw,
-        "biz_note": biz_note,
-        "delivery": delivery,
-        "raw_text": raw_text
-    }, errors
-
-def _handle整理寄書(event, text):
-    body = re.sub(r"^#整理寄書\s*", "", text.strip())
-    parsed, errs = _parse_raw_to_order(body)
-    if errs:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(errs)))
-        return
-
-    books_line = parsed.get("book_raw") or ""
-    warn = "\n\n⚠️ 未辨識到書名，請補充或調整後再確認。" if not books_line else ""
-
-    msg = (
-        "#寄書\n"
-        f"姓名：{parsed.get('name') or ''}\n"
-        f"電話：{parsed.get('phone') or ''}\n"
-        f"寄送地址：{parsed.get('address') or ''}\n"
-        f"書籍名稱：{books_line}\n"
-        f"備註：{parsed.get('biz_note') or ''}"
-        f"{warn}"
-    )
-
-    _PENDING[event.source.user_id] = {
-        "type": "整理寄書_confirm",
-        "data": parsed,
-    }
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text="請確認以下資訊：\n\n" + msg + "\n\n回覆 OK / YES 確認；回覆 N 取消。")
-    )
-
-
-def _handle_new_order(event, text):
-    try:
-        profile = line_bot_api.get_profile(event.source.user_id)
-        display_name = profile.display_name
-    except Exception:
-        display_name = "LINE使用者"
-
-    parsed, errs = _parse_new_order_text(text)
-    if errs:
-        msg = "❌ 建檔失敗：\n- " + "\n- ".join(errs)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        return
-
-    # ★★ 多本書切割 + 個別解析
-    raw_list = [s for s in _BOOK_SPLIT_RE.split(parsed["book_raw"] or "") if s.strip()]
-    if not raw_list:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 建檔失敗：未讀到有效書名"))
-        return
-
-    formal_list = []
-    amb_msgs, nf_msgs = [], []
-    for token in raw_list:
-        bk, kind, extra = resolve_book_name(token)
-        if not bk:
-            if kind == "ambiguous" and extra:
-                amb_msgs.append(f"「{token}」可能是：{ '、'.join(extra[:10]) }")
-            else:
-                nf_msgs.append(f"找不到書名：{token}")
-        else:
-            formal_list.append(bk)
-
-    if amb_msgs:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 書名不夠明確：\n" + "\n".join(amb_msgs)))
-        return
-    if nf_msgs:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到書名：\n" + "\n".join(nf_msgs)))
-        return
-
-    # 取得表／產生同一組 RID
-    ws = _ws(MAIN_SHEET_NAME)
-    rid = _gen_next_record_id(ws, _get_header_map(ws))
-
-    # 逐本書展開為多列（同一 RID）
-    # 為維持輸入順序，連續插入第2列會造成反序；因此倒序插入即可保持最終自上而下=原順序。
-    for bk in reversed(formal_list):
-        row, _ = _build_insert_row(ws, parsed, display_name, force_rid=rid, force_book=bk)
-        _insert_row_values_no_inherit(ws, row, index=2)
-
-    resp = (
-        "✅ 已成功建檔\n"
-        f"紀錄ID：{rid}\n"
-        f"建單日期：{now_str_min()}\n"
-        f"姓名：{parsed['name']}｜電話：{parsed['phone']}\n"
-        f"地址：{row[_get_header_map(ws).get('寄送地址',6)-1]}\n"
-        f"書籍：{'、'.join(formal_list)}\n"
-        f"狀態：待處理"
-    )
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
-
-# ============================================
-# 功能 X-2：#整理寄書（原始資料 → 標準 #寄書 格式 → 等待確認）
-# ============================================
-def _handle整理寄書(event, text):
-    body = re.sub(r"^#整理寄書\s*", "", text.strip())
-    parsed, errs = _parse_raw_to_order(body)
-    if errs:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(errs)))
-        return
-
-    # 組成標準格式
-    msg = (
-        "#寄書\n"
-        f"姓名：{parsed['name']}\n"
-        f"電話：{parsed['phone']}\n"
-        f"寄送地址：{parsed['address']}\n"
-        f"書籍名稱：{parsed['book_raw']}\n"
-        f"備註：{parsed['biz_note']}"
-    )
-
-    # 存入 pending，等待使用者回覆 OK
-    _PENDING[event.source.user_id] = {
-        "type": "整理寄書_confirm",
-        "data": parsed,
-    }
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(
-            text="請確認以下資訊：\n\n"
-                 + msg +
-                 "\n\n回覆 OK / YES 確認；回覆 N 取消。"
-        )
-    )
-
-
-# ============================================
-# 功能 C：查詢寄書（預設不顯示「已刪除」）
-# （★★ 同一ID合併多本顯示）
-# ============================================
-def _handle_query(event, text):
-    q = re.sub(r"^#(查詢寄書|查寄書)\s*", "", text.strip())
-
-    ws = _ws(MAIN_SHEET_NAME)
-    h = _get_header_map(ws)
-    idxA = _col_idx(h, "紀錄ID", 1)
-    idxB = _col_idx(h, "建單日期", 2)
-    idxD = _col_idx(h, "學員姓名", 4)
-    idxE = _col_idx(h, "學員電話", 5)
-    idxG = _col_idx(h, "書籍名稱", 7)
-    idxI = _col_idx(h, "寄送方式", 9)
-    idxJ = _col_idx(h, "寄出日期", 10)
-    idxK = _col_idx(h, "託運單號", 11)
-    idxM = _col_idx(h, "寄送狀態", 13)
-
-    rows = ws.get_all_values()[1:]
-    since = datetime.now(TZ) - timedelta(days=QUERY_DAYS)
-
-    phone_digits = re.sub(r"\D+","", q)
-    is_phone = len(phone_digits) >= 7
-
-    # 先篩近 30 天且非已刪除；依查詢條件過濾
-    filtered = []
-    for r in rows:
-        try:
-            st = (r[idxM-1] or "").strip()
-            if st == "已刪除":
-                continue
-            dt_str = r[idxB-1].strip()
-            dt = None
-            if dt_str:
-                try:
-                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-                except Exception:
-                    dt = None
-            if dt and dt < since:
-                continue
-
-            if is_phone:
-                cand = re.sub(r"\D+","", r[idxE-1])
-                if len(cand) >= PHONE_SUFFIX_MATCH and phone_digits[-PHONE_SUFFIX_MATCH:] == cand[-PHONE_SUFFIX_MATCH:]:
-                    filtered.append(r)
-            else:
-                if q and q in r[idxD-1]:
-                    filtered.append(r)
-        except Exception:
-            continue
-
-    if not filtered:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 查無近 30 天內的寄書紀錄，請確認姓名或電話是否正確。"))
-        return
-
-    # ★★ 依 RID 合併
-    groups = {}
-    for r in filtered:
-        rid = (r[idxA-1] or "").strip()
-        if not rid:
-            continue
-        g = groups.setdefault(rid, {
-            "dt": r[idxB-1],
-            "name": r[idxD-1],
-            "books": [],
-            "status_any": set(),
-            "ship_out": "",
-            "ship_via": "",
-            "ship_no": ""
-        })
-        # 以最大時間為該群主時間
-        if r[idxB-1] > g["dt"]:
-            g["dt"] = r[idxB-1]
-        g["books"].append((r[idxG-1] or "").strip())
-        st = (r[idxM-1] or "").strip()
-        if st:
-            g["status_any"].add(st)
-        # 取較新的出貨欄位
-        j, i, k = (r[idxJ-1] or "").strip(), (r[idxI-1] or "").strip(), (r[idxK-1] or "").strip()
-        if j or i or k:
-            # 粗略策略：若尚未有資料，或這列時間較新，就覆蓋
-            if not (g["ship_out"] or g["ship_via"] or g["ship_no"]) or r[idxB-1] >= g["dt"]:
-                g["ship_out"], g["ship_via"], g["ship_no"] = j, i, k
-
-    # 依建單時間倒序；取前 5 組
-    ordered = sorted(groups.items(), key=lambda kv: kv[1]["dt"], reverse=True)[:5]
-
-    blocks = []
-    for rid, g in ordered:
-        books = "、".join(sorted(set([b for b in g["books"] if b])))
-        name = g["name"]
-        statuses = g["status_any"]
-        if "已託運" in statuses:
-            lines = [f"📦 {name}（{rid}）：{books}"]
-            if g["ship_out"]: lines.append(f"已於 {g['ship_out']}")
-            if g["ship_via"]: lines.append(f"由 {g['ship_via']} 寄出")
-            if g["ship_no"]:  lines.append(f"託運單號：{g['ship_no']}")
-            blocks.append("\n".join(lines))
-        else:
-            # 取一個代表狀態（沒有就顯示待處理）
-            st = next(iter(statuses)) if statuses else "待處理"
-            blocks.append(f"📦 {name}（{rid}）：{books} {st}")
-
-    msg = "\n\n".join(blocks)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-
-# ============================================
-# 功能 D：取消寄書（★★同一ID全部刪除；無刪除線；已刪除排除＋正確排序 修補）
-# 指令：#取消寄書 / #刪除寄書  +（姓名/電話）
-# 權限：建單人（C欄）須等於操作者的 LINE 顯示名稱
-# 確認：回覆 Y/N
-# ============================================
-_PENDING = {}  # user_id -> pending dict
-_OCR_SESSION = {}  # user_id -> {"type":"ship","expire_ts": epoch}
-
-def _extract_cancel_target(text: str):
-    body = re.sub(r"^#(取消寄書|刪除寄書)\s*", "", text.strip())
-    name, phone = None, None
-
-    data = parse_kv_lines(body)
-    for k in list(data.keys()):
-        if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
-            name = "、".join(data.pop(k)); break
-    for k in list(data.keys()):
-        if "電話" in k:
-            for v in data.pop(k):
-                p = normalize_phone(v)
-                if p: phone = p; break
-            break
-
-    if not name or not phone:
-        tokens = re.split(r"\s+", body)
-        for t in tokens:
-            tt = t.strip()
-            if not tt: continue
-            p = normalize_phone(tt)
-            if (not phone) and p: phone = p; continue
-            if not name and not re.search(r"\d", tt): name = tt
-    return (name, phone)
-
-# 🔧 修補版：排除「已刪除」，用可解析的建單時間做排序（取最近一筆）
-def _find_latest_order(ws, name, phone):
-    h = _get_header_map(ws)
-    idxA = _col_idx(h, "紀錄ID", 1)
-    idxB = _col_idx(h, "建單日期", 2)
-    idxC = _col_idx(h, "建單人", 3)
-    idxD = _col_idx(h, "學員姓名", 4)
-    idxE = _col_idx(h, "學員電話", 5)
-    idxM = _col_idx(h, "寄送狀態", 13)
-
-    all_vals = ws.get_all_values()
-    rows = all_vals[1:]
-    since = datetime.now(TZ) - timedelta(days=QUERY_DAYS)
-
-    phone_suffix = None
-    if phone:
-        pd = re.sub(r"\D+","", phone)
-        if len(pd) >= PHONE_SUFFIX_MATCH:
-            phone_suffix = pd[-PHONE_SUFFIX_MATCH:]
-
-    candidates = []
-    for ridx, r in enumerate(rows, start=2):
-        try:
-            # 1) 排除「已刪除」
-            if (r[idxM-1] or "").strip() == "已刪除":
-                continue
-
-            # 2) 解析建單日期，超過查詢窗範圍則跳過
-            dt_str = (r[idxB-1] or "").strip()
-            dt = None
-            if dt_str:
-                try:
-                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-                except Exception:
-                    dt = None
-            if dt and dt < since:
-                continue
-
-            # 3) 條件比對（姓名包含；電話後 N 碼）
-            ok = True
-            if name and name not in (r[idxD-1] or ""):
-                ok = False
-            if phone_suffix:
-                cand = re.sub(r"\D+","", r[idxE-1] or "")
-                if not (len(cand) >= PHONE_SUFFIX_MATCH and cand[-PHONE_SUFFIX_MATCH:] == phone_suffix):
-                    ok = False
-
-            if ok:
-                # 用「可比較的時間」當排序 key；若無法解析時間，用 datetime.min 墊底
-                key_dt = dt or datetime.min.replace(tzinfo=TZ)
-                candidates.append((key_dt, ridx, r))
-        except Exception:
-            continue
-
-    if not candidates:
-        return (None, None)
-    # 取建單時間最新的一筆
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, row_i, row = candidates[0]
-    return row_i, row
-
-def _collect_rows_by_rid(ws, rid: str):
-    """回傳該 RID 的所有 (row_index, row_values)"""
-    h = _get_header_map(ws)
-    idxA = _col_idx(h, "紀錄ID", 1)
-    all_vals = ws.get_all_values()[1:]
-    out = []
-    for ridx, r in enumerate(all_vals, start=2):
-        try:
-            if (r[idxA-1] or "").strip() == rid:
-                out.append((ridx, r))
-        except Exception:
-            continue
-    return out
-
-def _handle_cancel_request(event, text):
-    try:
-        profile = line_bot_api.get_profile(event.source.user_id)
-        display_name = profile.display_name or "LINE使用者"
-    except Exception:
-        display_name = "LINE使用者"
-
-    name, phone = _extract_cancel_target(text)
-    ws = _ws(MAIN_SHEET_NAME)
-    h = _get_header_map(ws)
-    idxA = _col_idx(h, "紀錄ID", 1)
-    idxB = _col_idx(h, "建單日期", 2)
-    idxC = _col_idx(h, "建單人", 3)
-    idxD = _col_idx(h, "學員姓名", 4)
-    idxG = _col_idx(h, "書籍名稱", 7)
-    idxJ = _col_idx(h, "寄出日期", 10)
-    idxK = _col_idx(h, "託運單號", 11)
-    idxL = _col_idx(h, "經手人", 12)
-    idxM = _col_idx(h, "寄送狀態", 13)
-    idxH = _col_idx(h, "業務備註", 8)
-
-    row_i, r = _find_latest_order(ws, name, phone)
-    if not row_i:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到紀錄"))
-        return
-
-    creator = (r[idxC-1] or "").strip() or "LINE使用者"
-    if creator != display_name:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 你沒有刪除權限（請聯繫管理者）"))
-        return
-
-    rid = (r[idxA-1] or "").strip()
-    all_rows = _collect_rows_by_rid(ws, rid)
-
-    # ★★ 若任一列為已託運或有出書欄位 → 禁止刪除
-    for _, rr in all_rows:
-        status = (rr[idxM-1] or "").strip()
-        if status == "已託運":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 已託運，無法刪除"))
-            return
-        if (rr[idxJ-1] or rr[idxK-1]) and status != "已託運":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 無法處理，請私訊客服。"))
-            return
-
-    stu = (r[idxD-1] or "").strip()
-    books = "、".join([rr[idxG-1] for _, rr in all_rows if (rr[idxG-1] or "").strip()])
-    _PENDING[event.source.user_id] = {
-        "type": "cancel_order",
-        "sheet": MAIN_SHEET_NAME,
-        "rid": rid,
-        "rows": [ri for ri, _ in all_rows],
-        "stu": stu,
-        "book_list": books,
-        "operator": display_name,
-        "idx": {"H": idxH, "L": idxL, "M": idxM}
-    }
-    prompt = f"請確認是否刪除整筆寄書（同一ID {rid} 共 {len(all_rows)} 列）：\n學員：{stu}\n書名：{books}\n[Y/N]"
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=prompt))
-
-# ============================================
-# 功能 G：刪除／取消「出書」（撤銷已託運欄位）
-# 指令：#刪除出書 / #取消出書 +（姓名/電話）
-# 動作：清空 寄出日期/託運單號/經手人，狀態改為「待處理」，備註附上時間戳
-# ============================================
-def _extract_ship_delete_target(text: str):
-    body = re.sub(r"^#(刪除出書|取消出書)\s*", "", text.strip())
-    name, phone = None, None
-
-    data = parse_kv_lines(body)
-    for k in list(data.keys()):
-        if any(x in k for x in ["姓名","學員","收件人","名字","貴姓"]):
-            name = "、".join(data.pop(k)); break
-    for k in list(data.keys()):
-        if "電話" in k:
-            for v in data.pop(k):
-                p = normalize_phone(v)
-                if p: phone = p; break
-            break
-
-    if not name or not phone:
-        tokens = re.split(r"\s+", body)
-        for t in tokens:
-            tt = t.strip()
-            if not tt: continue
-            p = normalize_phone(tt)
-            if (not phone) and p: phone = p; continue
-            if not name and not re.search(r"\d", tt): name = tt
-    return (name, phone)
-
-def _handle_delete_ship(event, text):
-    try:
-        profile = line_bot_api.get_profile(event.source.user_id)
-        operator = profile.display_name or "LINE使用者"
-    except Exception:
-        operator = "LINE使用者"
-
-    name, phone = _extract_ship_delete_target(text)
-    ws = _ws(MAIN_SHEET_NAME)
-    h = _get_header_map(ws)
-    idxB = _col_idx(h, "建單日期", 2)
-    idxD = _col_idx(h, "學員姓名", 4)
-    idxE = _col_idx(h, "學員電話", 5)
-    idxH = _col_idx(h, "業務備註", 8)
-    idxJ = _col_idx(h, "寄出日期", 10)
-    idxK = _col_idx(h, "託運單號", 11)
-    idxL = _col_idx(h, "經手人", 12)
-    idxM = _col_idx(h, "寄送狀態", 13)
-
-    rows = ws.get_all_values()[1:]
-    since = datetime.now(TZ) - timedelta(days=QUERY_DAYS)
-
-    phone_suffix = None
-    if phone:
-        pd = re.sub(r"\D+","", phone)
-        if len(pd) >= PHONE_SUFFIX_MATCH:
-            phone_suffix = pd[-PHONE_SUFFIX_MATCH:]
-
-    candidates = []
-    for ridx, r in enumerate(rows, start=2):
-        try:
-            dt_str = (r[idxB-1] or "").strip()
-            dt = None
-            if dt_str:
-                try:
-                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-                except Exception:
-                    dt = None
-            if dt and dt < since: continue
-
-            ok = True
-            if name and name not in (r[idxD-1] or ""): ok = False
-            if phone_suffix:
-                cand = re.sub(r"\D+","", r[idxE-1] or "")
-                if not (len(cand) >= PHONE_SUFFIX_MATCH and cand[-PHONE_SUFFIX_MATCH:] == phone_suffix):
-                    ok = False
-            # 僅鎖定「已託運」或具出書欄位者
-            shipped = ((r[idxM-1] or "").strip() == "已託運") or (r[idxJ-1] or r[idxK-1])
-            if ok and shipped:
-                candidates.append((ridx, r))
-        except Exception:
-            continue
-
-    if not candidates:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 找不到可撤銷的出書紀錄（近30天）"))
-        return
-
-    # 取最近一筆
-    row_i, r = sorted(candidates, key=lambda x: x[1][idxB-1], reverse=True)[0]
-    # 清空欄位，狀態回「待處理」
-    note = f"[撤銷出書 {now_str_min()}]"
-    try:
-        curr_h = ws.cell(row_i, idxH).value or ""
-    except Exception:
-        curr_h = ""
-    ws.update_cell(row_i, idxH, (curr_h + " " + note).strip() if curr_h else note)
-    ws.update_cell(row_i, idxJ, "")
-    ws.update_cell(row_i, idxK, "")
-    ws.update_cell(row_i, idxL, operator)
-    ws.update_cell(row_i, idxM, "待處理")
-
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 已撤銷最近一筆出書：欄位已清空並恢復為待處理"))
-
-# ============================================
-# 功能 E：出書 OCR 啟用（#出書 開啟會話）
+# OCR 會話管理
 # ============================================
 def _start_ocr_session(user_id: str):
-    _OCR_SESSION[user_id] = {
-        "type": "ship",
-        "expire_ts": time.time() + OCR_SESSION_TTL_MIN * 60
-    }
+    """開啟 OCR 會話"""
+    expire = time.time() + (OCR_SESSION_TTL_MIN * 60)
+    _OCR_SESSIONS[user_id] = expire
+    app.logger.info(f"[OCR] 開啟會話: {user_id}")
 
 def _has_ocr_session(user_id: str) -> bool:
-    info = _OCR_SESSION.get(user_id)
-    if not info: return False
-    if time.time() > info["expire_ts"]:
-        _OCR_SESSION.pop(user_id, None)
+    """檢查是否有有效的 OCR 會話"""
+    if user_id not in _OCR_SESSIONS:
+        return False
+    if time.time() > _OCR_SESSIONS[user_id]:
+        _OCR_SESSIONS.pop(user_id, None)
         return False
     return True
 
 def _clear_ocr_session(user_id: str):
-    _OCR_SESSION.pop(user_id, None)
+    """清除 OCR 會話"""
+    _OCR_SESSIONS.pop(user_id, None)
+    app.logger.info(f"[OCR] 關閉會話: {user_id}")
 
-# ============================================
-# 功能 F：OCR 解析 + 寫回託運單資訊（加強版除錯）
-# ============================================
 def _download_line_image_bytes(message_id: str) -> bytes:
-    content = line_bot_api.get_message_content(message_id)
-    return b"".join(chunk for chunk in content.iter_content())
+    """下載 LINE 圖片"""
+    try:
+        content = line_bot_api.get_message_content(message_id)
+        return b"".join(content.iter_content())
+    except Exception as e:
+        app.logger.error(f"[OCR] 下載圖片失敗: {e}")
+        raise
 
 def _ocr_text_from_bytes(img_bytes: bytes) -> str:
+    """從圖片提取文字（修復 S1）"""
     if not _vision_client:
-        raise RuntimeError("Vision 用戶端未初始化（請確認 GOOGLE_SERVICE_ACCOUNT_JSON_NEW 已設定，且專案已啟用 Vision API）。")
-    image = vision.Image(content=img_bytes)
-    resp = _vision_client.text_detection(image=image)
-    if resp.error.message:
-        raise RuntimeError(resp.error.message)
-    text = resp.full_text_annotation.text if resp.full_text_annotation else ""
-    return text or ""
+        raise RuntimeError("Vision API 未初始化")
+    
+    try:
+        from google.cloud import vision
+        image = vision.Image(content=img_bytes)
+        response = _vision_client.text_detection(image=image)
+        
+        if response.error.message:
+            raise RuntimeError(f"Vision API 錯誤: {response.error.message}")
+        
+        texts = response.text_annotations
+        if texts:
+            return texts[0].description
+        return ""
+    except Exception as e:
+        app.logger.error(f"[OCR] 辨識失敗: {e}")
+        raise
 
-def _pair_ids_with_numbers(text: str):
-    if not text:
-        return [], ["未讀取到文字"]
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if LOG_OCR_RAW:
-        app.logger.info(f"[OCR_RAW_OUTPUT] {repr(text[:1000])}")
-
-    rids, nums = [], []
-    for i, ln in enumerate(lines):
-        for m in re.finditer(r"R\d{4}", ln):
-            rids.append((m.group(), i))
-        for m in re.finditer(r"\d{12}", ln):
-            nums.append((m.group(), i))
-
-    pairs, used_num, leftovers = [], set(), []
-    for rid, li in rids:
-        chosen, best_dist = None, 999
-        for no, lj in nums:
-            if (no, lj) in used_num:
-                continue
-            d = abs(lj - li)
-            if d < best_dist:
-                best_dist = d
-                chosen = (no, lj)
-        if chosen:
-            pairs.append((rid, chosen[0]))
-            used_num.add(chosen)
-        else:
-            leftovers.append(f"{rid}｜未找到 12 碼單號")
-
-    for no, lj in nums:
-        if (no, lj) not in used_num:
-            leftovers.append(f"未配對單號：{no}")
-
+# ============================================
+# OCR 配對邏輯
+# ============================================
+def _pair_ids_with_numbers(text: str) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """配對寄書ID與12碼單號"""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    
+    rid_pattern = re.compile(r"R\d{4}", re.IGNORECASE)
+    num_pattern = re.compile(r"\d{12}")
+    
+    rids = []
+    nums = []
+    leftovers = []
+    
+    for line in lines:
+        r_match = rid_pattern.search(line)
+        n_match = num_pattern.search(line)
+        
+        if r_match:
+            rids.append(r_match.group(0).upper())
+        if n_match:
+            nums.append(n_match.group(0))
+        
+        if not r_match and not n_match:
+            leftovers.append(line)
+    
+    pairs = list(zip(rids, nums))
     return pairs, leftovers
 
-# ★★ 加強版 OCR 寫回函數（詳細除錯日誌）
-def _write_ocr_results(pairs, event):
-    if not pairs:
-        return "❗ 未寫入任何資料（未找到配對）"
-    
-    ws = _ws(MAIN_SHEET_NAME)
-    h = _get_header_map(ws)
-    
-    # 記錄表頭資訊
-    app.logger.info(f"[OCR_DEBUG] Header map: {h}")
-    
-    idxA = _col_idx(h, "紀錄ID", 1)
-    idxJ = _col_idx(h, "寄出日期", 10)
-    idxK = _col_idx(h, "託運單號", 11)
-    idxL = _col_idx(h, "經手人", 12)
-    idxM = _col_idx(h, "寄送狀態", 13)
-    idxD = _col_idx(h, "學員姓名", 4)  # 用於除錯
-
+def _write_ocr_results(pairs: List[Tuple[str, str]], event) -> str:
+    """寫入 OCR 結果"""
     try:
-        profile = line_bot_api.get_profile(event.source.user_id)
-        uploader = profile.display_name or "LINE使用者"
+        uid = getattr(event.source, "user_id", "")
+        profile = line_bot_api.get_profile(uid)
+        operator = profile.display_name or "系統"
     except Exception:
-        uploader = "LINE使用者"
-
-    all_vals = ws.get_all_values()
-    app.logger.info(f"[OCR_DEBUG] Total rows in sheet: {len(all_vals)}")
+        operator = "系統"
     
-    rows = all_vals[1:]  # 跳過表頭
-
-    # ★★ 改用更安全的方式建立 RID 映射
-    id2rows = {}
-    for ridx, r in enumerate(rows, start=2):
-        try:
-            # 確保有足夠的欄位
-            if len(r) < idxA:
-                app.logger.warning(f"[OCR_DEBUG] Row {ridx} has insufficient columns: {len(r)}")
-                continue
-                
-            rid = (r[idxA-1] or "").strip()
-            if re.fullmatch(r"R\d{4}", rid):
-                # 記錄找到的RID和對應行號、姓名（用於除錯）
-                student_name = r[idxD-1] if len(r) >= idxD else "N/A"
-                app.logger.info(f"[OCR_DEBUG] Found RID {rid} at row {ridx}, student: {student_name}")
-                id2rows.setdefault(rid, []).append(ridx)
-        except Exception as e:
-            app.logger.error(f"[OCR_DEBUG] Error processing row {ridx}: {e}")
-            continue
-
-    app.logger.info(f"[OCR_DEBUG] RID mapping: {id2rows}")
-
-    updated = []
-    for rid, no in pairs:
-        row_is = id2rows.get(rid, [])
-        app.logger.info(f"[OCR_DEBUG] Updating RID {rid} with number {no} at rows: {row_is}")
+    try:
+        ws = _ws(MAIN_SHEET_NAME)
+        h = _get_header_map(ws)
+        all_vals = ws.get_all_values()
         
-        if not row_is:
-            app.logger.warning(f"[OCR_DEBUG] RID {rid} not found in sheets")
-            continue
+        idx_rid = _col_idx(h, "寄書ID", 1)
+        idx_tracking = _col_idx(h, "已託運-12碼單號", 10)
+        idx_date = _col_idx(h, "已託運-寄出日期", 11)
+        idx_person = _col_idx(h, "已託運-經手人", 12)
+        idx_status = _col_idx(h, "狀態", 13)
+        
+        success_count = 0
+        not_found = []
+        
+        for rid, tracking_num in pairs:
+            found_row = None
+            for i, r in enumerate(all_vals[1:], start=2):
+                if len(r) >= idx_rid and r[idx_rid - 1] == rid:
+                    found_row = i
+                    break
             
-        # 對同一RID的所有列都寫入相同的出貨資訊
-        for row_i in row_is:
-            try:
-                # 逐一更新每個欄位並記錄
-                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting tracking number to {no}")
-                ws.update_cell(row_i, idxK, f"'{no}")
-                
-                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting ship date to {today_str()}")
-                ws.update_cell(row_i, idxJ, today_str())
-                
-                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting handler to {uploader}")
-                ws.update_cell(row_i, idxL, uploader)
-                
-                app.logger.info(f"[OCR_DEBUG] Updating row {row_i}: setting status to 已託運")
-                ws.update_cell(row_i, idxM, "已託運")
-                
-            except Exception as e:
-                app.logger.error(f"[OCR_DEBUG] Error updating row {row_i}: {e}")
-                continue
-                
-        updated.append((rid, no))
-
-    if not updated:
-        return "❗ 未寫入（找不到對應的紀錄ID）"
-
-    lines = [f"{rid} → {no}" for rid, no in updated]
-    result_msg = "✅ 已更新：{} 筆\n{}".format(len(updated), "\n".join(lines))
-    app.logger.info(f"[OCR_DEBUG] Final result: {result_msg}")
-    return result_msg
+            if found_row:
+                _safe_update_cell(ws, found_row, idx_tracking, tracking_num)
+                _safe_update_cell(ws, found_row, idx_date, today_str())
+                _safe_update_cell(ws, found_row, idx_person, operator)
+                _safe_update_cell(ws, found_row, idx_status, "已託運")
+                success_count += 1
+                app.logger.info(f"[OCR] 更新 {rid} -> {tracking_num}")
+            else:
+                not_found.append(rid)
+        
+        msg = f"✅ 已更新 {success_count} 筆出貨單"
+        if not_found:
+            msg += f"\n\n⚠️ 找不到以下 ID：\n" + "\n".join(not_found)
+        
+        return msg
+    except Exception as e:
+        app.logger.error(f"[OCR] 寫入失敗: {e}")
+        raise
 
 # ============================================
-# 功能 H：入庫（#買書 / #入庫；支援負數＝盤點調整）
-# 《入庫明細》表頭：日期/經手人/書籍名稱/數量/來源/備註
+# 寄書功能（含驗證與引導修正）
+# ============================================
+def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
+    """驗證寄書資料，回傳錯誤清單（新功能）"""
+    errors = {
+        "name": [],
+        "phone": [],
+        "address": [],
+        "books": []
+    }
+    
+    # 驗證姓名
+    name = data.get("name", "").strip()
+    if not name:
+        errors["name"].append("姓名為必填")
+    
+    # 驗證電話
+    phone_raw = data.get("phone", "").strip()
+    phone = normalize_phone(phone_raw)
+    if not phone:
+        errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 10 碼手機號碼，例：0912345678）")
+    
+    # 驗證地址
+    address = data.get("address", "").strip()
+    if not address:
+        errors["address"].append("地址為必填")
+    else:
+        zip_code = _find_zip_code(address)
+        if not zip_code:
+            errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域）")
+    
+    # 驗證書籍
+    book_raw = data.get("book", "").strip()
+    if not book_raw:
+        errors["books"].append("書籍名稱為必填")
+    else:
+        book_names = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw) if x.strip()]
+        invalid_books = []
+        
+        for book_name in book_names:
+            matched = _find_book_exact(book_name)
+            if not matched:
+                invalid_books.append(book_name)
+        
+        if invalid_books:
+            for wrong_name in invalid_books:
+                suggestions = _suggest_books(wrong_name)
+                if suggestions:
+                    errors["books"].append({
+                        "wrong": wrong_name,
+                        "suggestions": suggestions
+                    })
+                else:
+                    errors["books"].append({
+                        "wrong": wrong_name,
+                        "suggestions": []
+                    })
+    
+    # 移除空錯誤
+    return {k: v for k, v in errors.items() if v}
+
+def _format_validation_errors(errors: Dict[str, List]) -> str:
+    """格式化驗證錯誤訊息（新功能）"""
+    lines = ["❌ 發現以下問題：\n"]
+    error_num = 1
+    
+    # 姓名錯誤
+    if "name" in errors:
+        for err in errors["name"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    # 電話錯誤
+    if "phone" in errors:
+        for err in errors["phone"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    # 地址錯誤
+    if "address" in errors:
+        for err in errors["address"]:
+            lines.append(f"{error_num}. {err}")
+            error_num += 1
+    
+    # 書籍錯誤
+    if "books" in errors:
+        for err_item in errors["books"]:
+            if isinstance(err_item, dict):
+                wrong = err_item["wrong"]
+                suggestions = err_item["suggestions"]
+                lines.append(f"{error_num}. 書籍名稱錯誤：「{wrong}」")
+                if suggestions:
+                    lines.append("   → 建議書籍：")
+                    for i, sugg in enumerate(suggestions, start=1):
+                        lines.append(f"     [{i}] {sugg}")
+                else:
+                    lines.append("   → 找不到相似書籍，請使用「#查書名」確認")
+                error_num += 1
+    
+    lines.append("\n---")
+    lines.append("📝 修正方式：")
+    lines.append("• 若書籍有建議選項，請回覆數字選擇（例：1）")
+    lines.append("• 或回覆「重新輸入」重填整筆資料")
+    lines.append("• 或回覆「N」取消本次登記")
+    
+    return "\n".join(lines)
+
+def _handle_new_order(event, text: str):
+    """處理新寄書（含驗證，修復 M2：統一命名）"""
+    lines_after = text.replace("#寄書", "").strip()
+    data = parse_kv_lines(lines_after)
+    
+    name = data.get("姓名", "").strip()
+    phone_raw = data.get("電話", "").strip()
+    address_raw = data.get("寄送地址", "").strip()
+    book_raw = data.get("書籍名稱", "").strip()
+    biz_note = data.get("業務備註", "").strip()
+    
+    # 驗證資料
+    validation_data = {
+        "name": name,
+        "phone": phone_raw,
+        "address": address_raw,
+        "book": book_raw
+    }
+    
+    errors = _validate_order_data(validation_data)
+    
+    if errors:
+        # 有錯誤，進入引導流程
+        error_msg = _format_validation_errors(errors)
+        
+        # 儲存待修正資料
+        _PENDING[event.source.user_id] = {
+            "type": "order_correction",
+            "data": validation_data,
+            "errors": errors,
+            "biz_note": biz_note
+        }
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+        return
+    
+    # 無錯誤，直接建立訂單
+    _create_order_confirmed(event, name, phone_raw, address_raw, book_raw, biz_note)
+
+def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, book_raw: str, biz_note: str):
+    """確認無誤後建立訂單（新函式）"""
+    try:
+        uid = getattr(event.source, "user_id", "")
+        profile = line_bot_api.get_profile(uid)
+        operator = profile.display_name or "系統"
+    except Exception:
+        operator = "系統"
+    
+    phone = normalize_phone(phone_raw)
+    zip_code = _find_zip_code(address_raw)
+    
+    if WRITE_ZIP_TO_ADDRESS and zip_code:
+        address = f"{zip_code} {address_raw}"
+    else:
+        address = address_raw
+    
+    # 解析書名
+    book_names = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw) if x.strip()]
+    final_books = []
+    for book_name in book_names:
+        matched = _find_book_exact(book_name)
+        if matched:
+            final_books.append(matched)
+        else:
+            final_books.append(book_name)  # 理論上不會到這裡
+    
+    try:
+        ws = _ws(MAIN_SHEET_NAME)
+        h = _get_header_map(ws)
+        all_vals = ws.get_all_values()
+        
+        # 生成新 ID
+        idx_rid = _col_idx(h, "寄書ID", 1)
+        existing_ids = [r[idx_rid - 1] for r in all_vals[1:] if len(r) >= idx_rid and r[idx_rid - 1].startswith("R")]
+        max_num = 0
+        for eid in existing_ids:
+            m = re.match(r"R(\d+)", eid)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+        new_rid = f"R{max_num + 1:04d}"
+        
+        # 寫入多列
+        created_rids = []
+        for book in final_books:
+            row = [
+                new_rid,
+                name,
+                phone,
+                address,
+                book,
+                biz_note,
+                "",  # 書袋編號
+                "",  # 備註
+                now_str_min(),
+                "",  # 託運單號
+                "",  # 寄出日期
+                operator,
+                "待處理"
+            ]
+            _safe_append_row(ws, row)
+            created_rids.append(new_rid)
+            app.logger.info(f"[ORDER] 建立寄書 {new_rid}: {name} / {book}")
+        
+        msg = f"✅ 寄書建立完成\n{new_rid}: {name}\n書籍：{', '.join(final_books)}"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    except Exception as e:
+        app.logger.error(f"[ORDER] 建立失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 建立失敗: {e}"))
+
+# ============================================
+# 查詢寄書
+# ============================================
+def _handle_query(event, text: str):
+    """查詢寄書（修復 M1：優化查詢）"""
+    query = text.replace("#查詢寄書", "").replace("#查寄書", "").strip()
+    
+    if not query:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入查詢關鍵字（姓名或電話後9碼）"))
+        return
+    
+    try:
+        ws = _ws(MAIN_SHEET_NAME)
+        h = _get_header_map(ws)
+        all_vals = ws.get_all_values()
+        
+        idx_rid = _col_idx(h, "寄書ID", 1)
+        idx_name = _col_idx(h, "姓名", 2)
+        idx_phone = _col_idx(h, "電話", 3)
+        idx_book = _col_idx(h, "書籍名稱", 5)
+        idx_status = _col_idx(h, "狀態", 13)
+        
+        # 查詢邏輯
+        query_digits = re.sub(r"\D", "", query)
+        matches = []
+        
+        for i, r in enumerate(all_vals[1:], start=2):
+            if len(r) < max(idx_rid, idx_name, idx_phone, idx_book, idx_status):
+                continue
+            
+            name = r[idx_name - 1] if len(r) >= idx_name else ""
+            phone = r[idx_phone - 1] if len(r) >= idx_phone else ""
+            
+            # 姓名比對
+            if query in name:
+                matches.append((i, r))
+                continue
+            
+            # 電話後9碼比對
+            if query_digits and len(query_digits) >= PHONE_SUFFIX_MATCH:
+                phone_digits = re.sub(r"\D", "", phone)
+                if phone_digits.endswith(query_digits[-PHONE_SUFFIX_MATCH:]):
+                    matches.append((i, r))
+                    continue
+        
+        if not matches:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"查無資料：{query}"))
+            return
+        
+        # 合併同 ID
+        grouped = {}
+        for row_i, r in matches:
+            rid = r[idx_rid - 1]
+            if rid not in grouped:
+                grouped[rid] = {
+                    "name": r[idx_name - 1],
+                    "phone": r[idx_phone - 1],
+                    "status": r[idx_status - 1],
+                    "books": []
+                }
+            grouped[rid]["books"].append(r[idx_book - 1])
+        
+        # 格式化輸出
+        lines = [f"查詢結果（共 {len(grouped)} 筆）：\n"]
+        for rid, info in list(grouped.items())[:10]:  # 最多10筆
+            books_str = "、".join(info["books"])
+            lines.append(f"{rid}: {info['name']}")
+            lines.append(f"  電話: {info['phone']}")
+            lines.append(f"  書籍: {books_str}")
+            lines.append(f"  狀態: {info['status']}\n")
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
+    except Exception as e:
+        app.logger.error(f"[QUERY] 查詢失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 查詢失敗: {e}"))
+
+# ============================================
+# 取消/刪除寄書（修復 M3）
+# ============================================
+def _handle_cancel_request(event, text: str):
+    """處理取消寄書請求"""
+    rid = text.replace("#取消寄書", "").replace("#刪除寄書", "").strip()
+    
+    if not rid:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入寄書ID（例：#取消寄書 R0001）"))
+        return
+    
+    try:
+        uid = getattr(event.source, "user_id", "")
+        profile = line_bot_api.get_profile(uid)
+        operator = profile.display_name or "系統"
+    except Exception:
+        operator = "系統"
+    
+    try:
+        ws = _ws(MAIN_SHEET_NAME)
+        h = _get_header_map(ws)
+        all_vals = ws.get_all_values()
+        
+        idx_rid = _col_idx(h, "寄書ID", 1)
+        idx_name = _col_idx(h, "姓名", 2)
+        idx_book = _col_idx(h, "書籍名稱", 5)
+        idx_status = _col_idx(h, "狀態", 13)
+        
+        matching_rows = []
+        for i, r in enumerate(all_vals[1:], start=2):
+            if len(r) >= idx_rid and r[idx_rid - 1] == rid:
+                matching_rows.append((i, r))
+        
+        if not matching_rows:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到寄書ID：{rid}"))
+            return
+        
+        # 檢查是否已建單
+        for row_i, r in matching_rows:
+            status = r[idx_status - 1] if len(r) >= idx_status else ""
+            if status != "待處理":
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ {rid} 已進入「{status}」狀態，無法取消"))
+                return
+        
+        # 儲存待確認
+        stu_name = matching_rows[0][1][idx_name - 1]
+        book_list = "、".join([r[idx_book - 1] for _, r in matching_rows])
+        
+        _PENDING[event.source.user_id] = {
+            "type": "cancel_order",
+            "sheet": MAIN_SHEET_NAME,
+            "rid": rid,
+            "stu": stu_name,
+            "book_list": book_list,
+            "rows": [row_i for row_i, _ in matching_rows],
+            "operator": operator,
+            "idx": {
+                "H": _col_idx(h, "備註", 8),
+                "L": _col_idx(h, "已託運-經手人", 12),
+                "M": _col_idx(h, "狀態", 13)
+            }
+        }
+        
+        msg = f"確認刪除寄書？\n{rid}: {stu_name}\n書籍：{book_list}\n\n回覆「Y / YES / OK」確認；或回覆「N」取消。"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    except Exception as e:
+        app.logger.error(f"[CANCEL] 處理失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 處理失敗: {e}"))
+
+# ============================================
+# 刪除/取消出書
+# ============================================
+def _handle_delete_ship(event, text: str):
+    """刪除出書記錄"""
+    rid = text.replace("#刪除出書", "").replace("#取消出書", "").strip()
+    
+    if not rid:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入寄書ID（例：#刪除出書 R0001）"))
+        return
+    
+    try:
+        ws = _ws(MAIN_SHEET_NAME)
+        h = _get_header_map(ws)
+        all_vals = ws.get_all_values()
+        
+        idx_rid = _col_idx(h, "寄書ID", 1)
+        idx_tracking = _col_idx(h, "已託運-12碼單號", 10)
+        idx_date = _col_idx(h, "已託運-寄出日期", 11)
+        idx_person = _col_idx(h, "已託運-經手人", 12)
+        idx_status = _col_idx(h, "狀態", 13)
+        
+        found = False
+        for i, r in enumerate(all_vals[1:], start=2):
+            if len(r) >= idx_rid and r[idx_rid - 1] == rid:
+                _safe_update_cell(ws, i, idx_tracking, "")
+                _safe_update_cell(ws, i, idx_date, "")
+                _safe_update_cell(ws, i, idx_person, "")
+                _safe_update_cell(ws, i, idx_status, "待處理")
+                found = True
+        
+        if found:
+            app.logger.info(f"[DELETE_SHIP] 已撤銷出書: {rid}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已撤銷 {rid} 的出貨記錄"))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到寄書ID：{rid}"))
+    except Exception as e:
+        app.logger.error(f"[DELETE_SHIP] 失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 處理失敗: {e}"))
+
+# ============================================
+# 入庫功能
 # ============================================
 def _ensure_stockin_sheet():
-    return _get_or_create_ws(STOCK_IN_SHEET_NAME, ["日期","經手人","書籍名稱","數量","來源","備註"])
+    """確保入庫明細表存在"""
+    return _get_or_create_ws(STOCK_IN_SHEET_NAME, ["入庫日期", "經手人", "書名", "數量", "來源", "備註"])
 
-def _parse_stockin_text(body: str):
-    """
-    逐行解析。每行抓最後一個整數(可含 +/-)作為數量；找不到則預設 1。
-    書名：去除數量後送 resolve_book_name。
-    回傳：items=[{"name":書名,"qty":數量}], errors=[str], ambiguous=[(raw,[候選])]
-    """
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    items, errors, ambiguous = [], [], []
-    for ln in lines:
-        # 支援 +/-：x -3 / × -3 / * -3 / 結尾 -3 / 數量：-3
-        m = re.search(r"(?:x|×|\*)\s*([+-]?\d+)$", ln, re.I)
-        if not m:
-            m = re.search(r"([+-]?\d+)\s*(本|套|冊)?$", ln)
-        if not m:
-            m = re.search(r"數量[:：]\s*([+-]?\d+)", ln)
-
-        qty = int(m.group(1)) if m else 1
-
-        # 去掉尾端數量片段
-        title = ln
-        if m:
-            title = ln[:m.start()].strip()
-
-        # 清理連接符
-        title = re.sub(r"[：:\-–—]+$", "", title).strip()
-
-        book, kind, extra = resolve_book_name(title)
-        if not book:
-            if kind == "ambiguous" and extra:
-                ambiguous.append((ln, extra[:10]))
-            else:
-                errors.append(f"找不到書名：{ln}")
-            continue
-        items.append({"name": book, "qty": qty})
-    if not lines:
-        errors.append("沒有讀到任何內容")
-    return items, errors, ambiguous
-
-def _handle_stockin(event, text):
+def _handle_stockin(event, text: str):
+    """處理入庫（修復 M2）"""
     try:
-        profile = line_bot_api.get_profile(event.source.user_id)
-        operator = profile.display_name or "LINE使用者"
+        uid = getattr(event.source, "user_id", "")
+        profile = line_bot_api.get_profile(uid)
+        operator = profile.display_name or "系統"
     except Exception:
-        operator = "LINE使用者"
-
-    body = re.sub(r"^#(買書|入庫)\s*", "", text.strip())
-    items, errs, amb = _parse_stockin_text(body)
-
-    if amb:
-        tips = []
-        for raw, choices in amb:
-            tips.append(f"「{raw}」可能是：{ '、'.join(choices) }")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❗ 書名不夠明確：\n" + "\n".join(tips)))
+        operator = "系統"
+    
+    lines_after = text.replace("#買書", "").replace("#入庫", "").strip()
+    
+    if not lines_after:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入書名與數量（例：#入庫 首爾大學1A 5）"))
         return
-    if errs:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 入庫資料有誤：\n- " + "\n- ".join(errs)))
-        return
+    
+    # 解析書名與數量
+    items = []
+    for line in lines_after.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        
+        qty_str = parts[-1]
+        book_candidate = " ".join(parts[:-1])
+        
+        try:
+            qty = int(qty_str)
+        except ValueError:
+            continue
+        
+        matched = _find_book_exact(book_candidate)
+        if matched:
+            items.append({"name": matched, "qty": qty})
+    
     if not items:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 沒有可入庫的項目"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法辨識書名，請使用「#查書名」確認正確書名"))
         return
-
+    
     # 合併相同書名
     merged = {}
     for it in items:
         merged[it["name"]] = merged.get(it["name"], 0) + int(it["qty"])
     items = [{"name": k, "qty": v} for k, v in merged.items()]
-
+    
     has_negative = any(it["qty"] < 0 for it in items)
-
-    # 存入 pending 等確認
+    
+    # 儲存待確認
     _PENDING[event.source.user_id] = {
         "type": "stock_in_confirm",
         "operator": operator,
         "items": items
     }
+    
     lines = [f"• {it['name']} × {it['qty']}" for it in items]
     suffix = "\n\n※ 含負數（自動標示來源：盤點調整）" if has_negative else ""
     msg = "請確認入庫項目：\n" + "\n".join(lines) + suffix + "\n\n回覆「OK / YES / Y」確認；或回覆「N」取消。"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
-def _write_stockin_rows(operator: str, items: list[dict]):
+def _write_stockin_rows(operator: str, items: list):
+    """寫入入庫記錄"""
     ws = _ensure_stockin_sheet()
     rows = []
     for it in items:
         qty = int(it["qty"])
         source = "購買" if qty >= 0 else "盤點調整"
         rows.append([today_str(), operator, it["name"], qty, source, ""])
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    _safe_append_rows(ws, rows)
 
 # ============================================
-# 功能 I＋共用：處理待確認回答（Y/N/YES/OK）
-# （含：取消寄書多列同ID一次刪）
+# 新功能：#查書名
 # ============================================
-def _handle_pending_answer(event, text):
+def _handle_search_books(event, text: str):
+    """處理查書名指令（新功能）"""
+    keyword = text.replace("#查書名", "").strip()
+    
+    if not keyword:
+        msg = (
+            "📚 查書名使用說明：\n\n"
+            "請輸入關鍵字搜尋書籍，例如：\n"
+            "• #查書名 韓文\n"
+            "• #查書名 首爾\n"
+            "• #查書名 startup\n"
+            "• #查書名 多益\n"
+            "• #查書名 兒童\n\n"
+            "系統會列出所有符合的書籍名稱"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return
+    
+    results = _search_books_by_keyword(keyword)
+    
+    if not results:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到包含「{keyword}」的書籍"))
+        return
+    
+    # 依語別分組
+    grouped = {}
+    for book in results:
+        lang = book["lang"] or "其他"
+        if lang not in grouped:
+            grouped[lang] = []
+        grouped[lang].append(book)
+    
+    # 格式化輸出
+    lines = [f"找到 {len(results)} 本書籍：\n"]
+    
+    for lang, books in sorted(grouped.items()):
+        lines.append(f"【{lang}】")
+        for book in books[:20]:  # 每類最多20本
+            stock_info = f"（庫存 {book['stock']}）" if book['stock'] != "" else ""
+            lines.append(f"  • {book['name']} {stock_info}")
+        if len(books) > 20:
+            lines.append(f"  ... 還有 {len(books) - 20} 本")
+        lines.append("")
+    
+    # LINE 訊息長度限制
+    msg = "\n".join(lines)
+    if len(msg) > 4500:
+        msg = msg[:4500] + "\n\n⚠️ 結果過多，已截斷。請使用更精確的關鍵字。"
+    
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+# ============================================
+# 整理寄書（保留原功能）
+# ============================================
+def _handle_organize_order(event, text: str):
+    """整理寄書功能（修復 M2：統一命名）"""
+    lines_after = text.replace("#整理寄書", "").strip()
+    data = parse_kv_lines(lines_after)
+    
+    name = data.get("姓名", "").strip()
+    phone = data.get("電話", "").strip()
+    address = data.get("寄送地址", "").strip()
+    book_raw = data.get("書籍名稱", "").strip()
+    biz_note = data.get("業務備註", "").strip()
+    
+    if not all([name, phone, address, book_raw]):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 資料不完整（需：姓名、電話、地址、書籍名稱）"))
+        return
+    
+    _PENDING[event.source.user_id] = {
+        "type": "organize_order_confirm",
+        "data": {
+            "name": name,
+            "phone": phone,
+            "address": address,
+            "book_raw": book_raw,
+            "biz_note": biz_note
+        }
+    }
+    
+    msg = f"確認建立寄書？\n姓名：{name}\n電話：{phone}\n地址：{address}\n書籍：{book_raw}\n\n回覆「Y / YES / OK」確認；或回覆「N」取消。"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+# ============================================
+# 處理待確認回答（修復 S2：移除重複程式碼）
+# ============================================
+def _handle_pending_answer(event, text: str) -> bool:
+    """處理待確認回答"""
     pend = _PENDING.get(event.source.user_id)
-    if not pend: return False
-    ans = text.strip().upper()
-    if ans not in ("Y","N","YES","OK"):
+    if not pend:
         return False
-    if ans in ("N",):
+    
+    ans = text.strip().upper()
+    
+    # 取消
+    if ans == "N":
         _PENDING.pop(event.source.user_id, None)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。"))
         return True
-
-    # YES / OK / Y
+    
+    # 處理書籍選擇（數字）
+    if pend.get("type") == "order_correction" and ans.isdigit():
+        return _handle_book_selection(event, int(ans))
+    
+    # 重新輸入
+    if ans in ("重新輸入", "RETRY", "REDO"):
+        _PENDING.pop(event.source.user_id, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已清除，請重新輸入完整 #寄書 資料"))
+        return True
+    
+    # 確認
+    if ans not in ("Y", "YES", "OK"):
+        return False
+    
+    # 取消寄書
     if pend["type"] == "cancel_order":
         ws = _ws(pend["sheet"])
         idxH = pend["idx"]["H"]
         idxL = pend["idx"]["L"]
         idxM = pend["idx"]["M"]
-
+        
         append_note = f"[已刪除 {now_str_min()}]"
-        for row_i in sorted(pend["rows"], reverse=False):
+        for row_i in pend["rows"]:
             try:
                 curr_h = ws.cell(row_i, idxH).value or ""
             except Exception:
                 curr_h = ""
             new_h = (curr_h + " " + append_note).strip() if curr_h else append_note
-            ws.update_cell(row_i, idxH, new_h)
-            ws.update_cell(row_i, idxL, pend["operator"])
-            ws.update_cell(row_i, idxM, "已刪除")
-
+            _safe_update_cell(ws, row_i, idxH, new_h)
+            _safe_update_cell(ws, row_i, idxL, pend["operator"])
+            _safe_update_cell(ws, row_i, idxM, "已刪除")
+        
         msg = f"✅ 已刪除整筆寄書（{pend['rid']}）：{pend['stu']} 的 {pend['book_list']}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         _PENDING.pop(event.source.user_id, None)
         return True
-
+    
+    # 入庫確認
     if pend["type"] == "stock_in_confirm":
         _write_stockin_rows(pend["operator"], pend["items"])
         lines = [f"{it['name']} × {it['qty']}" for it in pend["items"]]
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 入庫完成：\n" + "\n".join(lines)))
         _PENDING.pop(event.source.user_id, None)
         return True
-
-    if pend["type"] == "整理寄書_confirm":
-        # 將資料轉換成 #寄書 格式文字，交給既有的 _handle_new_order
+    
+    # 整理寄書確認（修復 S2：只保留一份）
+    if pend["type"] == "organize_order_confirm":
         data = pend["data"]
         fake_text = (
             "#寄書\n"
@@ -1711,23 +1260,57 @@ def _handle_pending_answer(event, text):
         _handle_new_order(event, fake_text)
         _PENDING.pop(event.source.user_id, None)
         return True
-
-    if pend["type"] == "整理寄書_confirm":
-        data = pend["data"]
-        book_raw = data.get("book_raw") or ""
-        fake_text = (
-            "#寄書\n"
-            f"姓名：{data.get('name') or ''}\n"
-            f"電話：{data.get('phone') or ''}\n"
-            f"寄送地址：{data.get('address') or ''}\n"
-            f"書籍名稱：{book_raw}\n"
-            f"業務備註：{data.get('biz_note') or ''}"
-        )
-        _handle_new_order(event, fake_text)
-        _PENDING.pop(event.source.user_id, None)
-        return True
-
+    
     return False
+
+def _handle_book_selection(event, choice: int) -> bool:
+    """處理書籍選擇（新功能）"""
+    pend = _PENDING.get(event.source.user_id)
+    if not pend or pend.get("type") != "order_correction":
+        return False
+    
+    errors = pend.get("errors", {})
+    if "books" not in errors:
+        return False
+    
+    # 找到第一個有建議的錯誤書名
+    for err_item in errors["books"]:
+        if isinstance(err_item, dict) and err_item.get("suggestions"):
+            suggestions = err_item["suggestions"]
+            if 1 <= choice <= len(suggestions):
+                selected_book = suggestions[choice - 1]
+                
+                # 更新資料中的書名
+                old_name = err_item["wrong"]
+                current_books = pend["data"]["book"]
+                new_books = current_books.replace(old_name, selected_book)
+                pend["data"]["book"] = new_books
+                
+                # 重新驗證
+                validation_data = pend["data"]
+                new_errors = _validate_order_data(validation_data)
+                
+                if not new_errors:
+                    # 無錯誤，直接建立訂單
+                    _create_order_confirmed(
+                        event,
+                        validation_data["name"],
+                        validation_data["phone"],
+                        validation_data["address"],
+                        new_books,
+                        pend.get("biz_note", "")
+                    )
+                    _PENDING.pop(event.source.user_id, None)
+                else:
+                    # 還有其他錯誤，繼續引導
+                    pend["errors"] = new_errors
+                    error_msg = _format_validation_errors(new_errors)
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
+                
+                return True
+    
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無效的選項"))
+    return True
 
 # ============================================
 # LINE Webhook
@@ -1743,12 +1326,12 @@ def callback():
         abort(400)
     return "OK"
 
-# 文字訊息處理（功能 J：只處理指定指令）
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
+    """處理文字訊息"""
     text = (event.message.text or "").strip()
-
-    # 功能 I：#我的ID（不受白名單限制）
+    
+    # #我的ID（不受白名單限制）
     if text.startswith("#我的ID"):
         uid = getattr(event.source, "user_id", "")
         try:
@@ -1766,76 +1349,82 @@ def handle_text_message(event):
         if uid:
             _log_candidate(uid, name)
         return
-
-    # 共用：待確認流程（Y/N/YES/OK）
+    
+    # 待確認流程
     if _handle_pending_answer(event, text):
         return
-
-    # 白名單檢查（其餘指令都要）
+    
+    # 白名單檢查
     if not _ensure_authorized(event, scope="text"):
         return
-
-    # 僅處理以下指令；其餘直接不回覆
-
+    
+    # 處理指令
+    if text.startswith("#查書名"):
+        _handle_search_books(event, text)
+        return
+    
     if text.startswith("#整理寄書"):
-        _handle整理寄書(event, text); return
+        _handle_organize_order(event, text)
+        return
     
     if text.startswith("#寄書"):
-        _handle_new_order(event, text); return
-
+        _handle_new_order(event, text)
+        return
+    
     if text.startswith("#查詢寄書") or text.startswith("#查寄書"):
-        _handle_query(event, text); return
-
+        _handle_query(event, text)
+        return
+    
     if text.startswith("#取消寄書") or text.startswith("#刪除寄書"):
-        _handle_cancel_request(event, text); return
-
+        _handle_cancel_request(event, text)
+        return
+    
     if text.startswith("#刪除出書") or text.startswith("#取消出書"):
-        _handle_delete_ship(event, text); return
-
+        _handle_delete_ship(event, text)
+        return
+    
     if text.startswith("#出書"):
-        # 開啟 OCR 視窗
         _start_ocr_session(getattr(event.source, "user_id", ""))
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"已啟用出書OCR（{OCR_SESSION_TTL_MIN} 分鐘）。請上傳出貨單照片。"))
         return
-
+    
     if text.startswith("#買書") or text.startswith("#入庫"):
-        _handle_stockin(event, text); return
+        _handle_stockin(event, text)
+        return
+    
+    # 其他文字不處理
 
-    # 其他文字：不處理、不回覆
-    return
-
-# 圖片訊息處理（功能 E：僅在 #出書 後 N 分鐘內才啟用）
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    # 白名單：未授權直接擋（圖片不回覆）
+    """處理圖片訊息"""
     if not _ensure_authorized(event, scope="image"):
         return
-
+    
     uid = getattr(event.source, "user_id", "")
     if not _has_ocr_session(uid):
-        # 未先 #出書 或已逾時：不處理、不回覆
         return
-
+    
     try:
         app.logger.info(f"[IMG] 收到圖片 user_id={uid} msg_id={event.message.id}")
         img_bytes = _download_line_image_bytes(event.message.id)
+        
         if not _vision_client:
-            # 有啟動OCR會話，但 Vision 未設定 → 回覆錯誤
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="❌ OCR 錯誤：Vision 未初始化（請設定 GOOGLE_SERVICE_ACCOUNT_JSON_NEW 並啟用 Vision API）。")
             )
             return
-
+        
         text = _ocr_text_from_bytes(img_bytes)
         if LOG_OCR_RAW:
             app.logger.info(f"[OCR_TEXT]\n{text}")
-
+        
         pairs, leftovers = _pair_ids_with_numbers(text)
         resp = _write_ocr_results(pairs, event)
+        
         if leftovers:
-            resp += "\n\n❗以下項目需人工檢核：\n" + "\n".join(leftovers[:10])
-
+            resp += "\n\n❗以下項目需人工檢核：\n" + "\n".join(leftovers[:MAX_LEFTOVER_ITEMS])
+        
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
     except Exception as e:
         code = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
@@ -1845,19 +1434,17 @@ def handle_image_message(event):
         except Exception:
             pass
     finally:
-        # 單次處理後關閉會話；如需多張，再輸入 #出書
         _clear_ocr_session(uid)
 
-# 健康檢查
 @app.route("/", methods=["GET"])
 def index():
+    """健康檢查"""
     try:
         names = [ws.title for ws in ss.worksheets()]
         return "OK / Worksheets: " + ", ".join(names)
     except Exception as e:
         return f"OK / (Sheets not loaded) {e}"
 
-# 本地執行（Railway 用 gunicorn 啟動）
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
