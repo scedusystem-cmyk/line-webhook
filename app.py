@@ -97,6 +97,7 @@ LOG_OCR_RAW = os.getenv("LOG_OCR_RAW", "true").lower() == "true"
 OCR_SESSION_TTL_MIN = int(os.getenv("OCR_SESSION_TTL_MIN", "10"))
 MAX_BOOK_SUGGESTIONS = 3  # 最多建議書籍數量
 MAX_LEFTOVER_ITEMS = 10   # OCR 未配對項目最多顯示數量
+INSERT_AT_TOP = True  # 固定在第二列插入新資料
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -212,10 +213,17 @@ def _safe_update_cell(ws, row: int, col: int, value: Any):
         raise
 
 def _safe_append_row(ws, row_data: list):
-    """安全新增列（修復 H2 + M3）"""
+    """安全新增列（固定插入第二列，不繼承格式）"""
     try:
-        ws.append_row(row_data, value_input_option="USER_ENTERED")
-        app.logger.info(f"[SHEETS] 新增列至 {ws.title}: {row_data[:3]}...")
+        if INSERT_AT_TOP:
+            # 在第 2 列（表頭下方）插入新資料
+            # inheritFromBefore=False 確保不繼承上方格式
+            ws.insert_row(row_data, index=2, value_input_option="USER_ENTERED", inherit_from_before=False)
+            app.logger.info(f"[SHEETS] 插入列至 {ws.title} 第2列: {row_data[:3]}...")
+        else:
+            # 在最下面新增（保留原邏輯，但目前不使用）
+            ws.append_row(row_data, value_input_option="USER_ENTERED")
+            app.logger.info(f"[SHEETS] 新增列至 {ws.title}: {row_data[:3]}...")
     except Exception as e:
         app.logger.error(f"[SHEETS] 新增列失敗: {e}")
         raise
@@ -850,13 +858,15 @@ def _handle_new_order(event, text: str):
     _create_order_confirmed(event, name, phone_raw, address_raw, book_raw, biz_note)
 
 def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, book_raw: str, biz_note: str):
-    """確認無誤後建立訂單（新函式）"""
+    """確認無誤後建立訂單（根據實際表頭動態寫入）"""
     try:
         uid = getattr(event.source, "user_id", "")
         profile = line_bot_api.get_profile(uid)
         operator = profile.display_name or "系統"
     except Exception:
         operator = "系統"
+    
+    app.logger.info(f"[ORDER] 開始建立訂單 - 姓名:{name}, 電話:{phone_raw}, 書籍:{book_raw}")
     
     phone = normalize_phone(phone_raw)
     zip_code = _find_zip_code(address_raw)
@@ -866,6 +876,8 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
     else:
         address = address_raw
     
+    app.logger.info(f"[ORDER] 處理後 - 電話:{phone}, 郵遞區號:{zip_code}, 地址:{address}")
+    
     # 解析書名
     book_names = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw) if x.strip()]
     final_books = []
@@ -874,15 +886,24 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
         if matched:
             final_books.append(matched)
         else:
-            final_books.append(book_name)  # 理論上不會到這裡
+            final_books.append(book_name)
+    
+    app.logger.info(f"[ORDER] 解析書名完成: {final_books}")
     
     try:
+        app.logger.info(f"[ORDER] 準備寫入工作表: {MAIN_SHEET_NAME}")
         ws = _ws(MAIN_SHEET_NAME)
         h = _get_header_map(ws)
+        app.logger.info(f"[ORDER] 表頭對應: {h}")
+        
         all_vals = ws.get_all_values()
+        header = all_vals[0] if all_vals else []
+        app.logger.info(f"[ORDER] 實際表頭: {header}")
+        app.logger.info(f"[ORDER] 目前資料列數: {len(all_vals)}")
         
         # 生成新 ID
-        idx_rid = _col_idx(h, "寄書ID", 1)
+        # 支援多種 ID 欄位名稱
+        idx_rid = _col_idx(h, "寄書ID", _col_idx(h, "紀錄ID", 1))
         existing_ids = [r[idx_rid - 1] for r in all_vals[1:] if len(r) >= idx_rid and r[idx_rid - 1].startswith("R")]
         max_num = 0
         for eid in existing_ids:
@@ -891,33 +912,82 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
                 max_num = max(max_num, int(m.group(1)))
         new_rid = f"R{max_num + 1:04d}"
         
+        app.logger.info(f"[ORDER] 生成新ID: {new_rid} (目前最大編號: {max_num})")
+        
+        # 根據表頭欄位數量建立空白列
+        num_cols = len(header)
+        
         # 寫入多列
-        created_rids = []
         for book in final_books:
-            row = [
-                new_rid,
-                name,
-                phone,
-                address,
-                book,
-                biz_note,
-                "",  # 書袋編號
-                "",  # 備註
-                now_str_min(),
-                "",  # 託運單號
-                "",  # 寄出日期
-                operator,
-                "待處理"
-            ]
+            # 建立空白列（填滿所有欄位）
+            row = [""] * num_cols
+            
+            # 根據表頭名稱填入對應資料
+            # ID 欄位
+            if "寄書ID" in h:
+                row[h["寄書ID"] - 1] = new_rid
+            elif "紀錄ID" in h:
+                row[h["紀錄ID"] - 1] = new_rid
+            
+            # 建單日期
+            if "建單日期" in h:
+                row[h["建單日期"] - 1] = today_str()
+            elif "建單時間" in h:
+                row[h["建單時間"] - 1] = now_str_min()
+            
+            # 建單人
+            if "建單人" in h:
+                row[h["建單人"] - 1] = operator
+            
+            # 姓名
+            if "學員姓名" in h:
+                row[h["學員姓名"] - 1] = name
+            elif "姓名" in h:
+                row[h["姓名"] - 1] = name
+            
+            # 電話
+            if "學員電話" in h:
+                row[h["學員電話"] - 1] = phone
+            elif "電話" in h:
+                row[h["電話"] - 1] = phone
+            
+            # 地址
+            if "寄送地址" in h:
+                row[h["寄送地址"] - 1] = address
+            elif "地址" in h:
+                row[h["地址"] - 1] = address
+            
+            # 書籍
+            if "書籍名稱" in h:
+                row[h["書籍名稱"] - 1] = book
+            
+            # 業務備註
+            if "業務備註" in h:
+                row[h["業務備註"] - 1] = biz_note
+            
+            # 經手人
+            if "經手人" in h:
+                row[h["經手人"] - 1] = operator
+            elif "已託運-經手人" in h:
+                row[h["已託運-經手人"] - 1] = ""  # 建單時不填
+            
+            # 狀態
+            if "寄送狀態" in h:
+                row[h["寄送狀態"] - 1] = "待處理"
+            elif "狀態" in h:
+                row[h["狀態"] - 1] = "待處理"
+            
+            app.logger.info(f"[ORDER] 準備寫入: {row[:5]}... (共 {len(row)} 欄)")
             _safe_append_row(ws, row)
-            created_rids.append(new_rid)
-            app.logger.info(f"[ORDER] 建立寄書 {new_rid}: {name} / {book}")
+            app.logger.info(f"[ORDER] ✅ 成功建立寄書 {new_rid}: {name} / {book}")
         
         msg = f"✅ 寄書建立完成\n{new_rid}: {name}\n書籍：{', '.join(final_books)}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        app.logger.info(f"[ORDER] 訂單建立完成，已回覆使用者")
     except Exception as e:
-        app.logger.error(f"[ORDER] 建立失敗: {e}")
+        app.logger.error(f"[ORDER] ❌ 建立失敗: {e}", exc_info=True)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 建立失敗: {e}"))
+        raise
 
 # ============================================
 # 查詢寄書
