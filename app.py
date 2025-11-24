@@ -502,18 +502,56 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
 # ============================================
 # 郵遞區號查詢（修復 H2）
 # ============================================
+def _normalize_address_for_compare(text: str) -> str:
+    """正規化地址用於比對（處理台/臺差異）"""
+    # 統一將「臺」轉換為「台」進行比對
+    return text.replace("臺", "台").replace("台", "台")
+
 def _find_zip_code(address: str) -> Optional[str]:
-    """查詢郵遞區號（修復 H2）"""
+    """查詢郵遞區號（支援縣市+區域匹配，最長匹配優先）"""
     try:
         ws = _ws(ZIPREF_SHEET_NAME)
         rows = ws.get_all_records()
         
+        # 正規化地址
+        address_normalized = _normalize_address_for_compare(address)
+        
+        # 收集所有匹配的區域，並按長度排序（最長優先）
+        matches = []
         for row in rows:
+            # 支援兩種格式：
+            # 格式1: 只有「區域」欄位（例：台南市北區）
+            # 格式2: 分別有「縣市」和「區域」欄位
+            
+            city = str(row.get("縣市", "")).strip()
             district = str(row.get("區域", "")).strip()
             zip_code = str(row.get("郵遞區號", "")).strip()
-            if district and district in address:
-                app.logger.info(f"[ZIP] 找到郵遞區號 {zip_code} for {district}")
-                return zip_code
+            
+            if not zip_code:
+                continue
+            
+            # 建構完整區域名稱
+            if city and district:
+                # 格式2: 縣市 + 區域
+                full_district = f"{city}{district}"
+            elif district:
+                # 格式1: 只有區域
+                full_district = district
+            else:
+                continue
+            
+            # 正規化並比對
+            full_district_normalized = _normalize_address_for_compare(full_district)
+            
+            if full_district_normalized in address_normalized:
+                matches.append((len(full_district_normalized), zip_code, full_district))
+        
+        if matches:
+            # 按匹配長度降序排序，取最長的
+            matches.sort(key=lambda x: x[0], reverse=True)
+            best_match = matches[0]
+            app.logger.info(f"[ZIP] 找到郵遞區號 {best_match[1]} for {best_match[2]} (原地址: {address})")
+            return best_match[1]
         
         app.logger.warning(f"[ZIP] 找不到郵遞區號: {address}")
         return None
