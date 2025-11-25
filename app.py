@@ -1174,11 +1174,11 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             elif "姓名" in h:
                 row[h["姓名"] - 1] = name
             
-            # 電話
+            # 電話（加上單引號強制文字格式，避免開頭 0 被移除）
             if "學員電話" in h:
-                row[h["學員電話"] - 1] = phone
+                row[h["學員電話"] - 1] = f"'{phone}" if phone else ""
             elif "電話" in h:
-                row[h["電話"] - 1] = phone
+                row[h["電話"] - 1] = f"'{phone}" if phone else ""
             
             # 地址
             if "寄送地址" in h:
@@ -1193,6 +1193,18 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             # 業務備註
             if "業務備註" in h:
                 row[h["業務備註"] - 1] = biz_note
+            
+            # 寄送方式（根據地址判別）
+            if "寄送方式" in h:
+                delivery_method = detect_delivery_method(address)
+                if delivery_method:
+                    # 偵測到超商
+                    row[h["寄送方式"] - 1] = delivery_method
+                elif address:
+                    # 有地址但不是超商 → 便利帶
+                    row[h["寄送方式"] - 1] = "便利帶"
+                else:
+                    row[h["寄送方式"] - 1] = ""
             
             # 經手人（建單時不填，出貨時才填）
             if "經手人" in h:
