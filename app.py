@@ -551,6 +551,21 @@ def _normalize_text_for_search(text: str) -> str:
     
     return ''.join(result)
 
+def detect_delivery_method(text: str) -> Optional[str]:
+    """偵測寄送方式（超商辨識）"""
+    if not text:
+        return None
+    s = text.lower().replace("—", "-").replace("／", "/")
+    if any(k in s for k in ["7-11", "7/11", "7／11", "7–11", "711", "小七"]):
+        return "7-11"
+    if "全家" in s or "family" in s:
+        return "全家"
+    if "萊爾富" in s or "hi-life" in s or "hilife" in s:
+        return "萊爾富"
+    if "ok" in s or "ok超商" in s:
+        return "OK"
+    return None
+
 def _normalize_address_for_compare(text: str) -> str:
     """正規化地址用於比對（處理台/臺差異）"""
     # 統一將「臺」轉換為「台」進行比對
@@ -704,11 +719,12 @@ def _write_ocr_results(pairs: List[Tuple[str, str]], event) -> str:
         h = _get_header_map(ws)
         all_vals = ws.get_all_values()
         
-        idx_rid = _col_idx(h, "寄書ID", 1)
-        idx_tracking = _col_idx(h, "已託運-12碼單號", 10)
-        idx_date = _col_idx(h, "已託運-寄出日期", 11)
-        idx_person = _col_idx(h, "已託運-經手人", 12)
-        idx_status = _col_idx(h, "狀態", 13)
+        # 支援多種表頭名稱
+        idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+        idx_tracking = _col_idx(h, "託運單號", _col_idx(h, "已託運-12碼單號", 11))
+        idx_date = _col_idx(h, "寄出日期", _col_idx(h, "已託運-寄出日期", 10))
+        idx_person = _col_idx(h, "經手人", _col_idx(h, "已託運-經手人", 12))
+        idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
         
         success_count = 0
         not_found = []
@@ -765,14 +781,21 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
         if not phone:
             errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 09 開頭的 10 碼手機號碼）")
     
-    # 驗證地址：需找到郵遞區號
+    # 驗證地址：檢查是否為超商或是否有郵遞區號
     address = data.get("address", "").strip()
     if not address:
         errors["address"].append("地址為必填")
     else:
-        zip_code = _find_zip_code(address)
-        if not zip_code:
-            errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
+        # 檢查是否為超商地址
+        delivery_method = detect_delivery_method(address)
+        if delivery_method:
+            # 是超商地址，放行
+            app.logger.info(f"[VALIDATION] 偵測到超商地址: {delivery_method}")
+        else:
+            # 不是超商，需要郵遞區號
+            zip_code = _find_zip_code(address)
+            if not zip_code:
+                errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
     
     # 驗證書籍（收集所有錯誤書名，但不立即提示建議）
     book_raw = data.get("book", "").strip()
@@ -1206,7 +1229,7 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
 # 查詢寄書
 # ============================================
 def _handle_query(event, text: str):
-    """查詢寄書（修復 M1：優化查詢）"""
+    """查詢寄書（支援多種表頭名稱）"""
     query = text.replace("#查詢寄書", "").replace("#查寄書", "").strip()
     
     if not query:
@@ -1218,11 +1241,14 @@ def _handle_query(event, text: str):
         h = _get_header_map(ws)
         all_vals = ws.get_all_values()
         
-        idx_rid = _col_idx(h, "寄書ID", 1)
-        idx_name = _col_idx(h, "姓名", 2)
-        idx_phone = _col_idx(h, "電話", 3)
-        idx_book = _col_idx(h, "書籍名稱", 5)
-        idx_status = _col_idx(h, "狀態", 13)
+        # 支援多種欄位名稱
+        idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+        idx_name = _col_idx(h, "學員姓名", _col_idx(h, "姓名", 4))
+        idx_phone = _col_idx(h, "學員電話", _col_idx(h, "電話", 5))
+        idx_book = _col_idx(h, "書籍名稱", 7)
+        idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
+        
+        app.logger.info(f"[QUERY] 欄位索引 - ID:{idx_rid}, 姓名:{idx_name}, 電話:{idx_phone}, 書籍:{idx_book}, 狀態:{idx_status}")
         
         # 查詢邏輯
         query_digits = re.sub(r"\D", "", query)
@@ -1254,15 +1280,16 @@ def _handle_query(event, text: str):
         # 合併同 ID
         grouped = {}
         for row_i, r in matches:
-            rid = r[idx_rid - 1]
+            rid = r[idx_rid - 1] if len(r) >= idx_rid else ""
             if rid not in grouped:
                 grouped[rid] = {
-                    "name": r[idx_name - 1],
-                    "phone": r[idx_phone - 1],
-                    "status": r[idx_status - 1],
+                    "name": r[idx_name - 1] if len(r) >= idx_name else "",
+                    "phone": r[idx_phone - 1] if len(r) >= idx_phone else "",
+                    "status": r[idx_status - 1] if len(r) >= idx_status else "",
                     "books": []
                 }
-            grouped[rid]["books"].append(r[idx_book - 1])
+            if len(r) >= idx_book:
+                grouped[rid]["books"].append(r[idx_book - 1])
         
         # 格式化輸出
         lines = [f"查詢結果（共 {len(grouped)} 筆）：\n"]
@@ -1275,7 +1302,7 @@ def _handle_query(event, text: str):
         
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
     except Exception as e:
-        app.logger.error(f"[QUERY] 查詢失敗: {e}")
+        app.logger.error(f"[QUERY] 查詢失敗: {e}", exc_info=True)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 查詢失敗: {e}"))
 
 # ============================================
@@ -1301,10 +1328,11 @@ def _handle_cancel_request(event, text: str):
         h = _get_header_map(ws)
         all_vals = ws.get_all_values()
         
-        idx_rid = _col_idx(h, "寄書ID", 1)
-        idx_name = _col_idx(h, "姓名", 2)
-        idx_book = _col_idx(h, "書籍名稱", 5)
-        idx_status = _col_idx(h, "狀態", 13)
+        # 支援多種表頭名稱
+        idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+        idx_name = _col_idx(h, "學員姓名", _col_idx(h, "姓名", 4))
+        idx_book = _col_idx(h, "書籍名稱", 7)
+        idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
         
         matching_rows = []
         for i, r in enumerate(all_vals[1:], start=2):
@@ -1335,9 +1363,9 @@ def _handle_cancel_request(event, text: str):
             "rows": [row_i for row_i, _ in matching_rows],
             "operator": operator,
             "idx": {
-                "H": _col_idx(h, "備註", 8),
-                "L": _col_idx(h, "已託運-經手人", 12),
-                "M": _col_idx(h, "狀態", 13)
+                "H": _col_idx(h, "業務備註", _col_idx(h, "備註", 8)),
+                "L": _col_idx(h, "經手人", _col_idx(h, "已託運-經手人", 12)),
+                "M": _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
             }
         }
         
@@ -1363,11 +1391,12 @@ def _handle_delete_ship(event, text: str):
         h = _get_header_map(ws)
         all_vals = ws.get_all_values()
         
-        idx_rid = _col_idx(h, "寄書ID", 1)
-        idx_tracking = _col_idx(h, "已託運-12碼單號", 10)
-        idx_date = _col_idx(h, "已託運-寄出日期", 11)
-        idx_person = _col_idx(h, "已託運-經手人", 12)
-        idx_status = _col_idx(h, "狀態", 13)
+        # 支援多種表頭名稱
+        idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+        idx_tracking = _col_idx(h, "託運單號", _col_idx(h, "已託運-12碼單號", 11))
+        idx_date = _col_idx(h, "寄出日期", _col_idx(h, "已託運-寄出日期", 10))
+        idx_person = _col_idx(h, "經手人", _col_idx(h, "已託運-經手人", 12))
+        idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
         
         found = False
         for i, r in enumerate(all_vals[1:], start=2):
