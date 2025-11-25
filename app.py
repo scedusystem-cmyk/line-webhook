@@ -1318,16 +1318,129 @@ def _handle_query(event, text: str):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 查詢失敗: {e}"))
 
 # ============================================
-# 取消/刪除寄書（修復 M3）
+# 取消/刪除寄書（支援 ID、姓名、電話）
 # ============================================
+def _extract_cancel_target(text: str):
+    """從取消寄書指令中提取查詢條件（姓名、電話、或 ID）"""
+    body = re.sub(r"^#(取消寄書|刪除寄書)\s*", "", text.strip())
+    
+    # 如果直接是 R 開頭，視為 ID
+    if body.startswith("R"):
+        return {"type": "id", "value": body}
+    
+    name, phone = None, None
+    
+    # 嘗試解析 key:value 格式
+    data = parse_kv_lines(body)
+    for k in list(data.keys()):
+        if any(x in k for x in ["姓名", "學員", "收件人", "名字", "貴姓"]):
+            name = data.pop(k)
+            break
+    for k in list(data.keys()):
+        if "電話" in k:
+            phone = normalize_phone(data.pop(k))
+            break
+    
+    # 如果沒有 key:value，嘗試直接解析
+    if not name and not phone:
+        tokens = re.split(r"\s+", body)
+        for t in tokens:
+            tt = t.strip()
+            if not tt:
+                continue
+            p = normalize_phone(tt)
+            if (not phone) and p:
+                phone = p
+                continue
+            if not name and not re.search(r"\d", tt):
+                name = tt
+    
+    if name or phone:
+        return {"type": "search", "name": name, "phone": phone}
+    
+    return None
+
+def _find_latest_order(ws, name: str, phone: str):
+    """根據姓名或電話查找最近一筆「待處理」的訂單"""
+    h = _get_header_map(ws)
+    idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+    idx_date = _col_idx(h, "建單日期", 2)
+    idx_name = _col_idx(h, "學員姓名", _col_idx(h, "姓名", 4))
+    idx_phone = _col_idx(h, "學員電話", _col_idx(h, "電話", 5))
+    idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
+    
+    all_vals = ws.get_all_values()
+    rows = all_vals[1:]
+    
+    # 電話後 N 碼比對
+    phone_suffix = None
+    if phone:
+        pd = re.sub(r"\D+", "", phone)
+        if len(pd) >= PHONE_SUFFIX_MATCH:
+            phone_suffix = pd[-PHONE_SUFFIX_MATCH:]
+    
+    candidates = []
+    for ridx, r in enumerate(rows, start=2):
+        try:
+            # 排除「已刪除」
+            status = (r[idx_status - 1] if len(r) >= idx_status else "").strip()
+            if status == "已刪除":
+                continue
+            
+            # 只查詢「待處理」
+            if status != "待處理":
+                continue
+            
+            # 姓名比對
+            if name:
+                row_name = (r[idx_name - 1] if len(r) >= idx_name else "")
+                if name not in row_name:
+                    continue
+            
+            # 電話比對
+            if phone_suffix:
+                row_phone = re.sub(r"\D+", "", r[idx_phone - 1] if len(r) >= idx_phone else "")
+                if not (len(row_phone) >= PHONE_SUFFIX_MATCH and row_phone[-PHONE_SUFFIX_MATCH:] == phone_suffix):
+                    continue
+            
+            # 解析建單時間
+            dt_str = (r[idx_date - 1] if len(r) >= idx_date else "").strip()
+            dt = None
+            if dt_str:
+                try:
+                    dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M")
+                except Exception:
+                    dt = None
+            
+            key_dt = dt or datetime.min
+            candidates.append((key_dt, ridx, r))
+        except Exception:
+            continue
+    
+    if not candidates:
+        return (None, None)
+    
+    # 取建單時間最新的一筆
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, row_i, row = candidates[0]
+    return row_i, row
+
+def _collect_rows_by_rid(ws, rid: str):
+    """回傳該 RID 的所有 (row_index, row_values)"""
+    h = _get_header_map(ws)
+    idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
+    all_vals = ws.get_all_values()[1:]
+    out = []
+    for ridx, r in enumerate(all_vals, start=2):
+        try:
+            if len(r) >= idx_rid and (r[idx_rid - 1] or "").strip() == rid:
+                out.append((ridx, r))
+        except Exception:
+            continue
+    return out
+
 def _handle_cancel_request(event, text: str):
-    """處理取消寄書請求"""
-    rid = text.replace("#取消寄書", "").replace("#刪除寄書", "").strip()
-    
-    if not rid:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入寄書ID（例：#取消寄書 R0001）"))
-        return
-    
+    """處理取消寄書請求（支援 ID、姓名、電話）"""
     try:
         uid = getattr(event.source, "user_id", "")
         profile = line_bot_api.get_profile(uid)
@@ -1335,10 +1448,18 @@ def _handle_cancel_request(event, text: str):
     except Exception:
         operator = "系統"
     
+    # 提取查詢條件
+    target = _extract_cancel_target(text)
+    
+    if not target:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="請輸入查詢條件：\n• #取消寄書 R0001\n• #取消寄書 測試\n• #取消寄書 0930125812"
+        ))
+        return
+    
     try:
         ws = _ws(MAIN_SHEET_NAME)
         h = _get_header_map(ws)
-        all_vals = ws.get_all_values()
         
         # 支援多種表頭名稱
         idx_rid = _col_idx(h, "紀錄ID", _col_idx(h, "寄書ID", 1))
@@ -1346,33 +1467,53 @@ def _handle_cancel_request(event, text: str):
         idx_book = _col_idx(h, "書籍名稱", 7)
         idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
         
-        matching_rows = []
-        for i, r in enumerate(all_vals[1:], start=2):
-            if len(r) >= idx_rid and r[idx_rid - 1] == rid:
-                matching_rows.append((i, r))
-        
-        if not matching_rows:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到寄書ID：{rid}"))
-            return
-        
-        # 檢查是否已建單
-        for row_i, r in matching_rows:
-            status = r[idx_status - 1] if len(r) >= idx_status else ""
-            if status != "待處理":
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ {rid} 已進入「{status}」狀態，無法取消"))
+        # 根據查詢類型處理
+        if target["type"] == "id":
+            # 直接用 ID 查詢
+            rid = target["value"]
+            all_rows = _collect_rows_by_rid(ws, rid)
+            
+            if not all_rows:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到寄書ID：{rid}"))
                 return
+            
+            # 檢查是否為待處理
+            for row_i, r in all_rows:
+                status = (r[idx_status - 1] if len(r) >= idx_status else "").strip()
+                if status != "待處理":
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ {rid} 狀態為「{status}」，只能取消「待處理」的訂單"))
+                    return
+            
+            # 取第一列的姓名
+            stu_name = all_rows[0][1][idx_name - 1] if len(all_rows[0][1]) >= idx_name else ""
+            
+        elif target["type"] == "search":
+            # 用姓名或電話查詢
+            name = target.get("name")
+            phone = target.get("phone")
+            
+            row_i, r = _find_latest_order(ws, name, phone)
+            
+            if not row_i:
+                query_str = name or phone or "?"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{query_str}」的待處理訂單"))
+                return
+            
+            rid = (r[idx_rid - 1] if len(r) >= idx_rid else "").strip()
+            stu_name = (r[idx_name - 1] if len(r) >= idx_name else "").strip()
+            all_rows = _collect_rows_by_rid(ws, rid)
+        
+        # 收集書籍列表
+        book_list = "、".join([r[idx_book - 1] for _, r in all_rows if len(r) >= idx_book and r[idx_book - 1]])
         
         # 儲存待確認
-        stu_name = matching_rows[0][1][idx_name - 1]
-        book_list = "、".join([r[idx_book - 1] for _, r in matching_rows])
-        
         _PENDING[event.source.user_id] = {
             "type": "cancel_order",
             "sheet": MAIN_SHEET_NAME,
             "rid": rid,
             "stu": stu_name,
             "book_list": book_list,
-            "rows": [row_i for row_i, _ in matching_rows],
+            "rows": [row_i for row_i, _ in all_rows],
             "operator": operator,
             "idx": {
                 "H": _col_idx(h, "業務備註", _col_idx(h, "備註", 8)),
@@ -1384,7 +1525,7 @@ def _handle_cancel_request(event, text: str):
         msg = f"確認刪除寄書？\n{rid}: {stu_name}\n書籍：{book_list}\n\n回覆「Y / YES / OK」確認；或回覆「N」取消。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
     except Exception as e:
-        app.logger.error(f"[CANCEL] 處理失敗: {e}")
+        app.logger.error(f"[CANCEL] 處理失敗: {e}", exc_info=True)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 處理失敗: {e}"))
 
 # ============================================
