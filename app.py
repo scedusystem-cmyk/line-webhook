@@ -552,10 +552,16 @@ def _normalize_text_for_search(text: str) -> str:
     return ''.join(result)
 
 def detect_delivery_method(text: str) -> Optional[str]:
-    """偵測寄送方式（超商辨識）"""
+    """偵測寄送方式（超商辨識 + 自取）"""
     if not text:
         return None
     s = text.lower().replace("—", "-").replace("／", "/")
+    
+    # 檢查自取
+    if "自取" in text or "self" in s or "pickup" in s:
+        return "自取"
+    
+    # 檢查超商
     if any(k in s for k in ["7-11", "7/11", "7／11", "7–11", "711", "小七"]):
         return "7-11"
     if "全家" in s or "family" in s:
@@ -564,6 +570,7 @@ def detect_delivery_method(text: str) -> Optional[str]:
         return "萊爾富"
     if "ok" in s or "ok超商" in s:
         return "OK"
+    
     return None
 
 def _normalize_address_for_compare(text: str) -> str:
@@ -781,18 +788,18 @@ def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
         if not phone:
             errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 09 開頭的 10 碼手機號碼）")
     
-    # 驗證地址：檢查是否為超商或是否有郵遞區號
+    # 驗證地址：檢查是否為超商、自取、或是否有郵遞區號
     address = data.get("address", "").strip()
     if not address:
         errors["address"].append("地址為必填")
     else:
-        # 檢查是否為超商地址
+        # 檢查是否為超商或自取
         delivery_method = detect_delivery_method(address)
         if delivery_method:
-            # 是超商地址，放行
-            app.logger.info(f"[VALIDATION] 偵測到超商地址: {delivery_method}")
+            # 是超商或自取，放行
+            app.logger.info(f"[VALIDATION] 偵測到寄送方式: {delivery_method}")
         else:
-            # 不是超商，需要郵遞區號
+            # 不是超商或自取，需要郵遞區號
             zip_code = _find_zip_code(address)
             if not zip_code:
                 errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
