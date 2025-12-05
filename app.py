@@ -1605,7 +1605,7 @@ def _handle_stockin(event, text: str):
     lines_after = text.replace("#買書", "").replace("#入庫", "").replace("#進書", "").strip()
     
     if not lines_after:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入書名與數量，格式範例：\n• S2*1\n• S2 1\n• 雅思1*2\n• 首爾大學1A 5"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入書名與數量，格式範例：\n• S2*1 或 S2 1\n• S3*2 或 S3 2\n• 雅思1*2 或 雅思1 2\n\n⚠️ 必須明確指定數量"))
         return
     
     # 解析書名與數量（支援多種格式）
@@ -1634,12 +1634,8 @@ def _handle_stockin(event, text: str):
                 book_candidate = parts[0].strip()
                 qty_str = parts[1].strip()
         
-        # 優先 3：結尾數字（但要小心書名本身有數字）
-        else:
-            m = re.search(r'(\d+)$', line)
-            if m:
-                qty_str = m.group(1)
-                book_candidate = line[:m.start()].strip()
+        # 如果沒有明確分隔符號或空格，跳過該行
+        # （避免 s2、雅思1 等被誤判為「s × 2」、「雅思 × 1」）
         
         # 驗證數量
         if not qty_str or not book_candidate:
@@ -1665,7 +1661,7 @@ def _handle_stockin(event, text: str):
     
     # 情況 1：完全找不到任何書
     if not items and not errors:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法辨識書名，請使用「#查書名」確認正確書名"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法辨識書名或數量\n\n請使用格式：\n• 書名*數量（如 S2*1）\n• 書名 數量（如 S2 1）\n\n或使用「#查書名」確認正確書名"))
         return
     
     # 情況 2：有錯誤（找不到的書名）
@@ -1733,10 +1729,12 @@ def _handle_stockin_correction(event, text: str) -> bool:
     if not pend or pend.get("type") != "stockin_correction":
         return False
     
+    # 移除可能重複輸入的指令
     user_input = text.strip()
+    user_input = user_input.replace("#買書", "").replace("#入庫", "").replace("#進書", "").strip()
     
     # 檢查是否取消
-    if user_input.upper() in ("取消", "N", "NO"):
+    if user_input.upper() in ("取消", "N", "NO", ""):
         _PENDING.pop(event.source.user_id, None)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消入庫"))
         return True
