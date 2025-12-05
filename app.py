@@ -460,10 +460,13 @@ def _find_book_exact(name: str) -> Optional[str]:
         if book_name_normalized == name_normalized:
             return book["name"]
     
-    # 2. 模糊比對欄位
+    # 2. 模糊比對欄位（支援逗號和空格分隔）
     for book in books:
         fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        fuzzy_names = [x.strip() for x in fuzzy_normalized.split() if x.strip()]
+        # 先用逗號切分，再用空格切分
+        fuzzy_names = []
+        for part in fuzzy_normalized.split(','):
+            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
         if name_normalized in fuzzy_names:
             return book["name"]
     
@@ -485,10 +488,13 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
         app.logger.info(f"[BOOK] 關鍵字「{wrong_name}」找到 {len(keyword_matches)} 本書")
         return keyword_matches[:max_results]
     
-    # 策略 2：模糊比對欄位精確匹配
+    # 策略 2：模糊比對欄位精確匹配（支援逗號和空格分隔）
     for book in books:
         fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        fuzzy_names = [x.strip() for x in fuzzy_normalized.split() if x.strip()]
+        # 先用逗號切分，再用空格切分
+        fuzzy_names = []
+        for part in fuzzy_normalized.split(','):
+            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
         if wrong_normalized in fuzzy_names:
             app.logger.info(f"[BOOK] 模糊欄位精確匹配「{wrong_name}」→ {book['name']}")
             return [book["name"]]
@@ -501,9 +507,12 @@ def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> 
         ratio = difflib.SequenceMatcher(None, wrong_normalized, book_name_normalized).ratio()
         candidates.append((ratio, book["name"]))
         
-        # 比對模糊欄位
+        # 比對模糊欄位（支援逗號和空格分隔）
         fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        for fuzzy in fuzzy_normalized.split():
+        fuzzy_names = []
+        for part in fuzzy_normalized.split(','):
+            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
+        for fuzzy in fuzzy_names:
             if fuzzy.strip():
                 ratio2 = difflib.SequenceMatcher(None, wrong_normalized, fuzzy.strip()).ratio()
                 candidates.append((ratio2, book["name"]))
@@ -1584,7 +1593,7 @@ def _ensure_stockin_sheet():
     return _get_or_create_ws(STOCK_IN_SHEET_NAME, ["入庫日期", "經手人", "書名", "數量", "來源", "備註"])
 
 def _handle_stockin(event, text: str):
-    """處理入庫（修復 M2）"""
+    """處理入庫（支援多種格式和錯誤引導）"""
     try:
         uid = getattr(event.source, "user_id", "")
         profile = line_bot_api.get_profile(uid)
@@ -1592,55 +1601,252 @@ def _handle_stockin(event, text: str):
     except Exception:
         operator = "系統"
     
-    lines_after = text.replace("#買書", "").replace("#入庫", "").strip()
+    # 支援多種指令
+    lines_after = text.replace("#買書", "").replace("#入庫", "").replace("#進書", "").strip()
     
     if not lines_after:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入書名與數量（例：#入庫 首爾大學1A 5）"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入書名與數量，格式範例：\n• S2*1\n• S2 1\n• 雅思1*2\n• 首爾大學1A 5"))
         return
     
-    # 解析書名與數量
+    # 解析書名與數量（支援多種格式）
     items = []
+    errors = []  # 記錄找不到的書名
+    
     for line in lines_after.split("\n"):
         line = line.strip()
         if not line:
             continue
         
-        parts = line.split()
-        if len(parts) < 2:
-            continue
+        book_candidate = None
+        qty_str = None
         
-        qty_str = parts[-1]
-        book_candidate = " ".join(parts[:-1])
+        # 優先 1：檢查明確分隔符號（*、×、x、X）
+        if re.search(r'[*×xX]', line):
+            parts = re.split(r'[*×xX]', line, maxsplit=1)
+            if len(parts) == 2:
+                book_candidate = parts[0].strip()
+                qty_str = parts[1].strip()
+        
+        # 優先 2：空格分隔（最後一段是數字）
+        elif ' ' in line:
+            parts = line.rsplit(maxsplit=1)
+            if len(parts) == 2 and parts[1].strip().lstrip('-').isdigit():
+                book_candidate = parts[0].strip()
+                qty_str = parts[1].strip()
+        
+        # 優先 3：結尾數字（但要小心書名本身有數字）
+        else:
+            m = re.search(r'(\d+)$', line)
+            if m:
+                qty_str = m.group(1)
+                book_candidate = line[:m.start()].strip()
+        
+        # 驗證數量
+        if not qty_str or not book_candidate:
+            continue
         
         try:
             qty = int(qty_str)
         except ValueError:
             continue
         
+        # 查找書名
         matched = _find_book_exact(book_candidate)
         if matched:
-            items.append({"name": matched, "qty": qty})
+            items.append({"name": matched, "qty": qty, "input": book_candidate})
+        else:
+            # 找不到，記錄錯誤並嘗試建議
+            suggestions = _suggest_books(book_candidate, max_results=5)
+            errors.append({
+                "input": book_candidate,
+                "qty": qty,
+                "suggestions": suggestions
+            })
     
-    if not items:
+    # 情況 1：完全找不到任何書
+    if not items and not errors:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無法辨識書名，請使用「#查書名」確認正確書名"))
         return
     
-    # 合併相同書名
+    # 情況 2：有錯誤（找不到的書名）
+    if errors:
+        # 儲存待修正狀態
+        _PENDING[event.source.user_id] = {
+            "type": "stockin_correction",
+            "operator": operator,
+            "items": items,  # 已找到的書
+            "errors": errors  # 待修正的書
+        }
+        
+        # 建立錯誤訊息
+        msg_lines = []
+        
+        if items:
+            msg_lines.append("✅ 已識別以下書籍：")
+            for it in items:
+                msg_lines.append(f"• {it['name']} × {it['qty']}")
+            msg_lines.append("")
+        
+        msg_lines.append("❌ 以下書名需要確認：\n")
+        
+        for idx, err in enumerate(errors, start=1):
+            msg_lines.append(f"{idx}. 「{err['input']}」× {err['qty']}")
+            if err['suggestions']:
+                msg_lines.append("   可能是：")
+                for i, sug in enumerate(err['suggestions'][:3], start=1):
+                    msg_lines.append(f"   {i}. {sug}")
+            else:
+                msg_lines.append("   ⚠️ 找不到類似書籍")
+            msg_lines.append("")
+        
+        msg_lines.append("請回覆：")
+        msg_lines.append("• 數字選擇建議書籍（如「1」）")
+        msg_lines.append("• 或輸入正確書名")
+        msg_lines.append("• 或回覆「取消」放棄")
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(msg_lines)))
+        return
+    
+    # 情況 3：全部找到，合併相同書名
     merged = {}
     for it in items:
         merged[it["name"]] = merged.get(it["name"], 0) + int(it["qty"])
-    items = [{"name": k, "qty": v} for k, v in merged.items()]
+    final_items = [{"name": k, "qty": v} for k, v in merged.items()]
     
-    has_negative = any(it["qty"] < 0 for it in items)
+    has_negative = any(it["qty"] < 0 for it in final_items)
     
     # 儲存待確認
     _PENDING[event.source.user_id] = {
         "type": "stock_in_confirm",
         "operator": operator,
-        "items": items
+        "items": final_items
     }
     
-    lines = [f"• {it['name']} × {it['qty']}" for it in items]
+    lines = [f"• {it['name']} × {it['qty']}" for it in final_items]
+    suffix = "\n\n※ 含負數（自動標示來源：盤點調整）" if has_negative else ""
+    msg = "請確認入庫項目：\n" + "\n".join(lines) + suffix + "\n\n回覆「OK / YES / Y」確認；或回覆「N」取消。"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+def _handle_stockin_correction(event, text: str) -> bool:
+    """處理入庫修正流程"""
+    pend = _PENDING.get(event.source.user_id)
+    if not pend or pend.get("type") != "stockin_correction":
+        return False
+    
+    user_input = text.strip()
+    
+    # 檢查是否取消
+    if user_input.upper() in ("取消", "N", "NO"):
+        _PENDING.pop(event.source.user_id, None)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消入庫"))
+        return True
+    
+    errors = pend.get("errors", [])
+    if not errors:
+        return False
+    
+    # 取第一個錯誤進行處理
+    first_error = errors[0]
+    
+    # 情況 1：使用者輸入數字選擇建議書籍
+    if user_input.isdigit():
+        choice = int(user_input)
+        suggestions = first_error.get("suggestions", [])
+        
+        if 1 <= choice <= len(suggestions):
+            selected_book = suggestions[choice - 1]
+            
+            # 加入已找到的書
+            pend["items"].append({
+                "name": selected_book,
+                "qty": first_error["qty"],
+                "input": first_error["input"]
+            })
+            
+            # 移除已處理的錯誤
+            errors.pop(0)
+            
+            # 檢查是否還有其他錯誤
+            if errors:
+                # 繼續處理下一個錯誤
+                _show_next_stockin_error(event, pend)
+            else:
+                # 全部處理完成，進入確認流程
+                _finalize_stockin_items(event, pend)
+            
+            return True
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 請輸入 1-{len(suggestions)} 的數字"))
+            return True
+    
+    # 情況 2：使用者直接輸入書名
+    matched = _find_book_exact(user_input)
+    if matched:
+        # 加入已找到的書
+        pend["items"].append({
+            "name": matched,
+            "qty": first_error["qty"],
+            "input": first_error["input"]
+        })
+        
+        # 移除已處理的錯誤
+        errors.pop(0)
+        
+        # 檢查是否還有其他錯誤
+        if errors:
+            _show_next_stockin_error(event, pend)
+        else:
+            _finalize_stockin_items(event, pend)
+        
+        return True
+    else:
+        # 還是找不到
+        suggestions = _suggest_books(user_input, max_results=5)
+        if suggestions:
+            msg_lines = [f"找不到「{user_input}」，可能是："]
+            for i, sug in enumerate(suggestions[:3], start=1):
+                msg_lines.append(f"{i}. {sug}")
+            msg_lines.append("\n請輸入數字選擇，或重新輸入正確書名")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(msg_lines)))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 找不到「{user_input}」，請使用「#查書名」確認正確書名，或回覆「取消」"))
+        return True
+
+def _show_next_stockin_error(event, pend):
+    """顯示下一個待修正的書名"""
+    errors = pend.get("errors", [])
+    if not errors:
+        return
+    
+    err = errors[0]
+    msg_lines = [f"請確認「{err['input']}」× {err['qty']}：\n"]
+    
+    if err['suggestions']:
+        for i, sug in enumerate(err['suggestions'][:3], start=1):
+            msg_lines.append(f"{i}. {sug}")
+        msg_lines.append("\n請輸入數字選擇，或輸入正確書名")
+    else:
+        msg_lines.append("⚠️ 找不到類似書籍")
+        msg_lines.append("請輸入正確書名，或回覆「取消」")
+    
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(msg_lines)))
+
+def _finalize_stockin_items(event, pend):
+    """完成入庫修正，進入最終確認"""
+    # 合併相同書名
+    merged = {}
+    for it in pend["items"]:
+        merged[it["name"]] = merged.get(it["name"], 0) + int(it["qty"])
+    final_items = [{"name": k, "qty": v} for k, v in merged.items()]
+    
+    has_negative = any(it["qty"] < 0 for it in final_items)
+    
+    # 更新為確認狀態
+    pend["type"] = "stock_in_confirm"
+    pend["items"] = final_items
+    pend.pop("errors", None)
+    
+    lines = [f"• {it['name']} × {it['qty']}" for it in final_items]
     suffix = "\n\n※ 含負數（自動標示來源：盤點調整）" if has_negative else ""
     msg = "請確認入庫項目：\n" + "\n".join(lines) + suffix + "\n\n回覆「OK / YES / Y」確認；或回覆「N」取消。"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
@@ -1766,6 +1972,10 @@ def _handle_pending_answer(event, text: str) -> bool:
     # 處理書籍選擇（數字）
     if pend.get("type") == "order_correction" and ans.isdigit():
         return _handle_book_selection(event, int(ans))
+    
+    # 處理入庫修正（數字選擇或輸入書名）
+    if pend.get("type") == "stockin_correction":
+        return _handle_stockin_correction(event, text)
     
     # 重新輸入
     if ans in ("重新輸入", "RETRY", "REDO"):
@@ -1950,7 +2160,7 @@ def handle_text_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"已啟用出書OCR（{OCR_SESSION_TTL_MIN} 分鐘）。請上傳出貨單照片。"))
         return
     
-    if text.startswith("#買書") or text.startswith("#入庫"):
+    if text.startswith("#買書") or text.startswith("#入庫") or text.startswith("#進書"):
         _handle_stockin(event, text)
         return
     
