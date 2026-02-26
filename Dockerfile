@@ -1,5 +1,7 @@
 FROM python:3.11.9-slim
 
+# cache-bust: 2026-02-26-v2
+
 # 安裝 Chromium 和相關套件
 RUN apt-get update && apt-get install -y \
     chromium \
