@@ -4,3 +4,4 @@ line-bot-sdk==3.10.2
 gspread==6.1.2
 google-auth==2.34.0
 google-cloud-vision==3.7.2
+anthropic>=0.40.0
