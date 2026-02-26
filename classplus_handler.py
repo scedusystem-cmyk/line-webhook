@@ -103,11 +103,11 @@ def run_classplus_task(student_info: dict) -> dict:
         logger.info(f"[CLASSPLUS] 開始執行 Computer Use，學生：{student_info.get('name')}")
 
         response = client.beta.messages.create(
-            model="claude-opus-4-5",
+            model="claude-opus-4-5-20251101",
             max_tokens=4096,
             tools=[
                 {
-                    "type": "computer_20241022",
+                    "type": "computer_20250124",
                     "name": "computer",
                     "display_width_px": 1280,
                     "display_height_px": 800,
@@ -115,7 +115,7 @@ def run_classplus_task(student_info: dict) -> dict:
                 }
             ],
             messages=[{"role": "user", "content": prompt}],
-            betas=["computer-use-2024-10-22"],
+            betas=["computer-use-2025-01-24"],
         )
 
         # 取得回應文字
