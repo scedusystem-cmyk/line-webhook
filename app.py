@@ -29,6 +29,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from linebot import LineBotApi, WebhookHandler
+from classplus_handler import parse_student_info, run_classplus_task, format_result_message
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage,
@@ -2083,6 +2084,54 @@ def _handle_book_selection(event, choice: int) -> bool:
     return True
 
 # ============================================
+# ClassPlus 訂課處理
+# ============================================
+def _handle_classplus_order(event, text: str):
+    """處理 #訂課 指令"""
+    uid = getattr(event.source, "user_id", "")
+    student_info = parse_student_info(text)
+
+    if not student_info.get("name"):
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=(
+                "❌ 格式錯誤，請依以下格式輸入：\n\n"
+                "#訂課\n"
+                "學生姓名：\n"
+                "學生程度：\n"
+                "信箱：\n"
+                "學習備註："
+            ))
+        )
+        return
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f"⏳ 正在處理 {student_info['name']} 的訂課，請稍候...")
+    )
+
+    result = run_classplus_task(student_info)
+    msg = format_result_message(result, student_info)
+
+    try:
+        if result.get("screenshot"):
+            import io
+            from linebot.models import ImageSendMessage
+            # 上傳截圖並回傳
+            line_bot_api.push_message(
+                getattr(event.source, "group_id", uid) or uid,
+                TextSendMessage(text=msg)
+            )
+        else:
+            line_bot_api.push_message(
+                getattr(event.source, "group_id", uid) or uid,
+                TextSendMessage(text=msg)
+            )
+    except Exception as e:
+        app.logger.error(f"[CLASSPLUS] 回傳訊息失敗: {e}")
+
+
+# ============================================
 # LINE Webhook
 # ============================================
 @app.route("/callback", methods=["POST"])
@@ -2129,6 +2178,10 @@ def handle_text_message(event):
         return
     
     # 處理指令
+    if text.startswith("#訂課"):
+        _handle_classplus_order(event, text)
+        return
+
     if text.startswith("#查書名"):
         _handle_search_books(event, text)
         return
