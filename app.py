@@ -572,7 +572,7 @@ def detect_delivery_method(text: str) -> Optional[str]:
         return "自取"
     
     # 檢查超商
-    if any(k in s for k in ["7-11", "7/11", "7／11", "7–11", "711", "小七"]):
+    if "7-11" in s:
         return "7-11"
     if "全家" in s or "family" in s:
         return "全家"
