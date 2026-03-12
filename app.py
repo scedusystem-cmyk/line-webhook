@@ -1211,9 +1211,9 @@ def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, 
             if "業務備註" in h:
                 row[h["業務備註"] - 1] = biz_note
             
-            # 寄送方式（根據地址判別）
+            # 寄送方式（根據原始地址判別，避免郵遞區號誤觸超商關鍵字）
             if "寄送方式" in h:
-                delivery_method = detect_delivery_method(address)
+                delivery_method = detect_delivery_method(address_raw)
                 if delivery_method:
                     # 偵測到超商
                     row[h["寄送方式"] - 1] = delivery_method
