@@ -2143,6 +2143,9 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        app.logger.exception(f"[CALLBACK] 未捕捉的例外: {e}")
+        return "OK"
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
