@@ -29,7 +29,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from linebot import LineBotApi, WebhookHandler
-from classplus_handler import parse_student_info, run_classplus_task, format_result_message
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage,
@@ -349,20 +348,45 @@ def normalize_phone(s: str) -> Optional[str]:
         return digits
     return None
 
+_ADDR_KEYS = ("寄送地址", "地址", "address", "Address")
+_BOOK_KEYS = ("書籍名稱", "書名", "book", "Book", "書籍")
+_ALL_KEYS = ("學員姓名", "姓名", "name", "Name", "學員電話", "電話", "phone", "Phone", "手機",
+             "業務備註", "備註", "note", "Note") + _ADDR_KEYS + _BOOK_KEYS
+_KNOWN_KEY_RE = re.compile(
+    r"^(" + "|".join(sorted((re.escape(k) for k in _ALL_KEYS), key=len, reverse=True)) + r")\s*[：:；;]\s*"
+)
+
 def parse_kv_lines(text: str) -> Dict[str, str]:
-    """解析 key:value 格式文字，支援多種欄位名稱"""
+    """解析 key:value 格式文字，支援多種欄位名稱；
+    沒有冒號的行視為上一個欄位的續行（地址中間換行不會被截斷）"""
     data = {}
+    cont = {}  # key -> 續行
+    last_key = None
     for line in text.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
-        if "：" in line:
-            k, v = line.split("：", 1)
-            data[k.strip()] = v.strip()
-        elif ":" in line:
-            k, v = line.split(":", 1)
-            data[k.strip()] = v.strip()
-    
+        # 已知欄位名開頭：冒號打成分號也認（例：「備註；點數商城購買」）
+        m = _KNOWN_KEY_RE.match(line)
+        if m:
+            last_key = m.group(1)
+            data[last_key] = line[m.end():].strip()
+            continue
+        m = re.match(r"^([^：:]{1,8})[：:](.*)$", line)
+        if m and not re.search(r"[\d/]", m.group(1)):
+            last_key = m.group(1).strip()
+            data[last_key] = m.group(2).strip()
+        elif last_key is not None:
+            # 沒有冒號、或冒號是書名的一部分（「…4/e: Facts & Figures」）＝上一欄的續行
+            cont.setdefault(last_key, []).append(line)
+
+    for k, extra in cont.items():
+        if k in _BOOK_KEYS:
+            sep = "\n"  # 書名維持換行，交給原本的多本切分
+        else:
+            sep = " "   # 地址等欄位用空格接，地址檢查靠這個空格抓「144 10號」
+        data[k] = sep.join([data[k]] + extra) if data[k] else sep.join(extra)
+
     # 欄位名稱正規化（支援多種寫法）
     normalized = {}
     
@@ -379,13 +403,13 @@ def parse_kv_lines(text: str) -> Dict[str, str]:
             break
     
     # 地址欄位
-    for key in ["寄送地址", "地址", "address", "Address"]:
+    for key in _ADDR_KEYS:
         if key in data:
             normalized["寄送地址"] = data[key]
             break
     
     # 書籍欄位
-    for key in ["書籍名稱", "書名", "book", "Book", "書籍"]:
+    for key in _BOOK_KEYS:
         if key in data:
             normalized["書籍名稱"] = data[key]
             break
@@ -450,94 +474,211 @@ def _search_books_by_keyword(keyword: str) -> List[Dict[str, Any]]:
     app.logger.info(f"[BOOK] 搜尋「{keyword}」找到 {len(results)} 本")
     return results
 
-def _find_book_exact(name: str) -> Optional[str]:
-    """精確查找書名（處理全形/半形差異）"""
+# ============================================
+# 書名比對（2026-11-13 改寫）
+# 依 LINE 群組 14 個月實際輸入調整：Let’s／Let's、空白、大小寫、
+# 【】與 - 寫法、韓文／韓語、初階／初級、五十音／50音、顏色、級數
+# ============================================
+import unicodedata
+
+_BOOK_SYNONYMS = [
+    ("韓文", "韓語"), ("日文", "日語"), ("初階", "初級"), ("基礎", "初級"),
+    ("五十音", "50音"), ("四十音", "40音"), ("聽力", "listening"),
+]
+_BOOK_PUNCT_RE = re.compile(
+    r"[\s'\"`´‘’“”\[\]【】()（）〔〕{}「」『』<>《》\-_—–:：.,，、;；!！?？|｜/／+＋&*~～]"
+)
+_BOOK_EDITION_RE = re.compile(
+    r"\d+\s*/\s*e\b|\d+(st|nd|rd|th)\b|\(with[^)]*\)|new\s*ed|n/e|[\(（]?(整套)?\d+本[\)）]?",
+    re.I,
+)
+_BOOK_LEVEL_WORDS = ["初級", "進階", "發音", "習作", "listening", "reading"]
+_BOOK_COLORS = "紅綠藍金"
+# 「現在上的課本」各種寫法（現在上課的課本、目前上的、縣在上的課本…）
+_CURRENT_BOOK_NAME = "現在上的課本"
+_CURRENT_BOOK_RE = re.compile(r"(現在|目前|正在|縣在|現再).{0,6}(課本|書|教材|上的|用的)|^(現在|目前|正在)上的")
+
+
+def _book_prep(s: str) -> str:
+    t = unicodedata.normalize("NFKC", s or "").lower()
+    for a, b in _BOOK_SYNONYMS:
+        t = t.replace(a, b)
+    return t
+
+
+def _norm_book(s: str) -> str:
+    """去掉空白與符號、統一全半形與同義字，用來比對"""
+    return _BOOK_PUNCT_RE.sub("", _book_prep(s))
+
+
+def _book_markers(s: str) -> set:
+    """抓出會區分不同書的記號：數字、級數（1A／A1）、顏色、初級／進階／發音…"""
+    t = _BOOK_EDITION_RE.sub(" ", _book_prep(s))
+    m = set()
+    for d in re.findall(r"\d+(?:\.\d+)?", t):
+        m.add("#" + d)
+    for x in re.findall(r"(?<![a-z])(\d[ab]|[ab]\d)(?![a-z0-9])", t):
+        m.add("L" + "".join(sorted(x)))
+    for x in re.findall(r"(?<=\s)([a-z])(?=\s*-|\s*$)", t):
+        m.add("S" + x)
+    for c in _BOOK_COLORS:
+        if c in t:
+            m.add(c)
+    for w in _BOOK_LEVEL_WORDS:
+        if w in t:
+            m.add(w)
+    return m
+
+
+_BOOK_INDEX = {"ts": -1.0, "books": None}
+
+
+def _book_index() -> List[Dict[str, Any]]:
+    """書目索引：每本書的正規化書名、別名、記號"""
     books = _load_books()
-    name_normalized = _normalize_text_for_search(name).lower().strip()
-    
-    # 1. 精確比對書名
-    for book in books:
-        book_name_normalized = _normalize_text_for_search(book["name"]).lower()
-        if book_name_normalized == name_normalized:
-            return book["name"]
-    
-    # 2. 模糊比對欄位（支援逗號和空格分隔）
-    for book in books:
-        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        # 先用逗號切分，再用空格切分
-        fuzzy_names = []
-        for part in fuzzy_normalized.split(','):
-            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
-        if name_normalized in fuzzy_names:
-            return book["name"]
-    
-    return None
+    if _BOOK_INDEX["books"] is not None and _BOOK_INDEX["ts"] == _BOOK_CACHE["ts"]:
+        return _BOOK_INDEX["books"]
+    idx = []
+    token_owner: Dict[str, set] = {}
+    for b in books:
+        aliases = []
+        for part in re.split(r"[,，]", b.get("fuzzy", "") or ""):
+            part = part.strip()
+            if not part:
+                continue
+            aliases.append(part)
+            toks = part.split()
+            if len(toks) > 1:
+                for tk in toks:
+                    token_owner.setdefault(_norm_book(tk), set()).add(b["name"])
+        keys = {_norm_book(b["name"])} | {_norm_book(a) for a in aliases}
+        keys.discard("")
+        markers = set(_book_markers(b["name"]))
+        for a in aliases:
+            markers |= _book_markers(a)
+        idx.append({"name": b["name"], "keys": keys, "markers": markers, "tokens": set()})
+    # 別名欄用空白分隔的單字：只有「全書目只有這本有」才當別名（避免 go、1、the 這種字亂配）
+    by_name = {x["name"]: x for x in idx}
+    for tk, owners in token_owner.items():
+        if tk and len(owners) == 1 and len(tk) >= 2:
+            by_name[next(iter(owners))]["tokens"].add(tk)
+    _BOOK_INDEX["books"] = idx
+    _BOOK_INDEX["ts"] = _BOOK_CACHE["ts"]
+    return idx
+
+
+def _markers_compatible(inp: set, book: set) -> bool:
+    return inp <= book
+
+
+def _score_key(q: str, key: str) -> float:
+    if not q or not key:
+        return 0.0
+    if q == key:
+        return 1.0
+    r = difflib.SequenceMatcher(None, q, key).ratio()
+    short, long_ = (q, key) if len(q) <= len(key) else (key, q)
+    if len(short) >= 4 and short in long_:
+        r = max(r, 0.9)
+    elif len(q) >= 2 and q in key:
+        r = max(r, 0.75)  # 「多益」「發音」「1B」這種短詞：列進候選，不自動選
+    return r
+
+
+def _resolve_book(raw: str) -> Dict[str, Any]:
+    """
+    回傳 {"status": "ok", "book": 書名, "changed": bool}
+       或 {"status": "ask", "cands": [書名...]}（有候選，要問）
+       或 {"status": "none", "cands": []}
+    """
+    q = _norm_book(raw)
+    if not q:
+        return {"status": "none", "cands": []}
+    idx = _book_index()
+
+    # 1. 完全相同（書名或別名）
+    for b in idx:
+        if q in b["keys"] or q in b["tokens"]:
+            return {"status": "ok", "book": b["name"], "changed": False}
+
+    # 2.「現在上的課本」家族
+    names = {b["name"] for b in idx}
+    if _CURRENT_BOOK_NAME in names and _CURRENT_BOOK_RE.search(unicodedata.normalize("NFKC", raw)):
+        return {"status": "ok", "book": _CURRENT_BOOK_NAME, "changed": True, "guess_current": True}
+
+    # 3. 打分：記號（數字、級數、顏色、初級／進階）要對得上
+    qm = _book_markers(raw)
+    scored = []
+    for b in idx:
+        s = max(_score_key(q, k) for k in b["keys"]) if b["keys"] else 0.0
+        compat = _markers_compatible(qm, b["markers"])
+        scored.append({"s": s, "compat": compat, "name": b["name"], "markers": b["markers"]})
+
+    plausible = sorted([x for x in scored if x["compat"] and x["s"] >= 0.6], key=lambda x: -x["s"])
+    if plausible:
+        top = plausible[0]["s"]
+        second = plausible[1]["s"] if len(plausible) > 1 else 0.0
+        unique = len(plausible) == 1
+        if (unique and (top >= 0.7 or (qm and top >= 0.6))) or (top >= 0.85 and top - second >= 0.15):
+            return {"status": "ok", "book": plausible[0]["name"], "changed": True}
+
+    # 4. 要問：記號對得上的排前面，只列跟最高分差不多的
+    ranked = sorted(scored, key=lambda x: x["s"] + (0.25 if x["compat"] else 0), reverse=True)
+    best = max((x["s"] for x in scored), default=0.0)
+    floor = max(0.45, best - (0.1 if best >= 0.9 else 0.25))
+    cands = [x["name"] for x in ranked if x["s"] >= floor]
+    # 顏色／初級進階／習作這種記號對得上的書排最前面（例：藍色多益、Let's Go 6 習作本）
+    strong = {m for m in qm if m[0] not in "#LS"}
+    if strong:
+        hit = [x["name"] for x in sorted(scored, key=lambda x: -x["s"]) if x["compat"]]
+        cands = hit[:5] + [c for c in cands if c not in hit[:5]]
+    cands = cands[:8]
+    if cands:
+        return {"status": "ask", "cands": cands}
+    return {"status": "none", "cands": []}
+
+
+def _split_book_segment(seg: str) -> List[str]:
+    """一段裡塞了好幾本書（「Try N5 + Try N4」「N4 N3 N2 N1」「【…進階篇】NEW TOEIC…」）時拆開；拆不了就原樣"""
+    if _resolve_book(seg)["status"] == "ok":
+        return [seg]
+    for sep in (r"\s*[+＋]\s*", r"\s+"):
+        parts = [p for p in re.split(sep, seg.strip()) if p.strip()]
+        if len(parts) > 1 and all(_resolve_book(p)["status"] == "ok" for p in parts):
+            return parts
+    # 整段裡找得到兩本以上完整書名
+    q = _norm_book(seg)
+    found = []
+    for b in sorted(_book_index(), key=lambda x: -max((len(k) for k in x["keys"]), default=0)):
+        for k in sorted(b["keys"], key=len, reverse=True):
+            if len(k) >= 5 and k in q:
+                found.append(b["name"])
+                q = q.replace(k, "", 1)
+                break
+    if len(found) >= 2 and len(q) <= 2:
+        return found
+    return [seg]
+
+
+def _split_books(book_raw: str) -> List[str]:
+    segs = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw or "") if x.strip()]
+    out = []
+    for s in segs:
+        out.extend(_split_book_segment(s))
+    return out
+
+
+def _find_book_exact(name: str) -> Optional[str]:
+    """有把握就回書名（含自動校正），沒把握回 None"""
+    r = _resolve_book(name)
+    return r["book"] if r["status"] == "ok" else None
+
 
 def _suggest_books(wrong_name: str, max_results: int = MAX_BOOK_SUGGESTIONS) -> List[str]:
-    """根據錯誤書名建議選項（優先關鍵字搜尋，處理全形/半形）"""
-    books = _load_books()
-    wrong_normalized = _normalize_text_for_search(wrong_name).lower().strip()
-    
-    # 策略 1：關鍵字搜尋（搜尋書名和模糊欄位）
-    keyword_matches = []
-    for book in books:
-        search_text = _normalize_text_for_search(f"{book['name']} {book['fuzzy']}").lower()
-        if wrong_normalized in search_text:
-            keyword_matches.append(book["name"])
-    
-    if keyword_matches:
-        app.logger.info(f"[BOOK] 關鍵字「{wrong_name}」找到 {len(keyword_matches)} 本書")
-        return keyword_matches[:max_results]
-    
-    # 策略 2：模糊比對欄位精確匹配（支援逗號和空格分隔）
-    for book in books:
-        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        # 先用逗號切分，再用空格切分
-        fuzzy_names = []
-        for part in fuzzy_normalized.split(','):
-            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
-        if wrong_normalized in fuzzy_names:
-            app.logger.info(f"[BOOK] 模糊欄位精確匹配「{wrong_name}」→ {book['name']}")
-            return [book["name"]]
-    
-    # 策略 3：相似度比對（difflib）
-    candidates = []
-    for book in books:
-        # 比對書名
-        book_name_normalized = _normalize_text_for_search(book["name"]).lower()
-        ratio = difflib.SequenceMatcher(None, wrong_normalized, book_name_normalized).ratio()
-        candidates.append((ratio, book["name"]))
-        
-        # 比對模糊欄位（支援逗號和空格分隔）
-        fuzzy_normalized = _normalize_text_for_search(book["fuzzy"]).lower()
-        fuzzy_names = []
-        for part in fuzzy_normalized.split(','):
-            fuzzy_names.extend([x.strip() for x in part.split() if x.strip()])
-        for fuzzy in fuzzy_names:
-            if fuzzy.strip():
-                ratio2 = difflib.SequenceMatcher(None, wrong_normalized, fuzzy.strip()).ratio()
-                candidates.append((ratio2, book["name"]))
-    
-    # 排序並去重
-    candidates = sorted(set(candidates), key=lambda x: x[0], reverse=True)
-    results = [name for score, name in candidates if score >= FUZZY_THRESHOLD]
-    
-    # 去重並限制數量
-    seen = set()
-    unique_results = []
-    for name in results:
-        if name not in seen:
-            seen.add(name)
-            unique_results.append(name)
-            if len(unique_results) >= max_results:
-                break
-    
-    if unique_results:
-        app.logger.info(f"[BOOK] 相似度匹配「{wrong_name}」找到 {len(unique_results)} 本書")
-    else:
-        app.logger.info(f"[BOOK] 找不到「{wrong_name}」的建議書籍")
-    
-    return unique_results
+    r = _resolve_book(wrong_name)
+    if r["status"] == "ok":
+        return [r["book"]]
+    return r["cands"][:max_results]
 
 # ============================================
 # 郵遞區號查詢（修復 H2）
@@ -565,80 +706,167 @@ def detect_delivery_method(text: str) -> Optional[str]:
     """偵測寄送方式（超商辨識 + 自取）"""
     if not text:
         return None
-    s = text.lower().replace("—", "-").replace("／", "/")
-    
+    s = unicodedata.normalize("NFKC", text).lower().replace("—", "-").replace("–", "-")
+    has_no = "號" in s and "店號" not in s
+
     # 檢查自取
-    if "自取" in text or "self" in s or "pickup" in s:
+    if "自取" in s or "self" in s or "pickup" in s:
         return "自取"
-    
-    # 檢查超商
-    if "7-11" in s:
+
+    # 檢查超商（有寫品牌就算，括號裡附門市地址也一樣）
+    if re.search(r"7\s*[-/]\s*11|7\s*-?\s*eleven|小七|統一超商", s):
         return "7-11"
     if "全家" in s or "family" in s:
         return "全家"
     if "萊爾富" in s or "hi-life" in s or "hilife" in s:
         return "萊爾富"
-    if "ok" in s or "ok超商" in s:
-        return "OK"
-    
+    # 只寫 711：沒有門牌號才算（避免郵遞區號 711 被誤判）；OK 超商已退出台灣，不再判斷
+    if not has_no and re.search(r"(?<!\d)7\s?11(?!\d)", s):
+        return "7-11"
     return None
 
+
+def _looks_like_unbranded_store(text: str) -> bool:
+    """「汐止力行店」「台中惠安門市」這種沒寫是哪家超商的店名"""
+    s = unicodedata.normalize("NFKC", text or "").strip()
+    return "號" not in s and bool(re.search(r"(門市|店)\s*$", s)) and len(s) <= 20
+
+
+# ============================================
+# 郵遞區號（2026-11-13 改寫：只打區名也能查、重名區要寫縣市、縣市與區對不上會擋）
+# ============================================
+_ZIP_CACHE = {"ts": 0.0, "rows": None}
+_ZIP_CACHE_TTL = 600
+
+_CITY_SHORT = ["台北", "新北", "桃園", "台中", "台南", "高雄", "基隆", "新竹", "嘉義", "苗栗",
+               "彰化", "南投", "雲林", "屏東", "宜蘭", "花蓮", "台東", "澎湖", "金門", "連江"]
+
+
 def _normalize_address_for_compare(text: str) -> str:
-    """正規化地址用於比對（處理台/臺差異）"""
-    # 統一將「臺」轉換為「台」進行比對
-    return text.replace("臺", "台").replace("台", "台")
+    """正規化地址用於比對（臺→台、全形→半形、巿→市、去空白）"""
+    t = unicodedata.normalize("NFKC", text or "")
+    t = t.replace("臺", "台").replace("巿", "市")
+    return re.sub(r"\s+", "", t)
+
+
+def _load_zip_rows() -> List[Dict[str, str]]:
+    now = time.time()
+    if _ZIP_CACHE["rows"] is not None and now - _ZIP_CACHE["ts"] < _ZIP_CACHE_TTL:
+        return _ZIP_CACHE["rows"]
+    try:
+        rows = _ws(ZIPREF_SHEET_NAME).get_all_records()
+        out = []
+        for r in rows:
+            city = _normalize_address_for_compare(str(r.get("縣市", "")))
+            dist = _normalize_address_for_compare(str(r.get("區域", "")))
+            z = str(r.get("郵遞區號", "")).strip()
+            if z and (city or dist):
+                out.append({"city": city, "dist": dist, "zip": z})
+        _ZIP_CACHE["rows"] = out
+        _ZIP_CACHE["ts"] = now
+        return out
+    except Exception as e:
+        app.logger.error(f"[ZIP] 載入參照表失敗: {e}")
+        return _ZIP_CACHE["rows"] or []
+
+
+def _city_short(city: str) -> str:
+    return city[:-1] if city and city[-1] in "市縣" else city
+
+
+def _resolve_zip(address: str) -> Dict[str, Any]:
+    """
+    回傳 {"zip": "950", "city": "台東縣", "district": "台東市", "fill": True/False, "error": ""}
+    fill=True 代表地址沒寫縣市，建單時要補上
+    """
+    addr = _normalize_address_for_compare(address)
+    body = re.sub(r"^\d{3,6}", "", addr)  # 去掉業務自己打的郵遞區號
+    rows = _load_zip_rows()
+    if not rows:
+        return {"zip": None, "error": "郵遞區號參照表讀取失敗，請稍後再試"}
+
+    # 1. 縣市＋區都寫了（最長優先）
+    full = []
+    for r in rows:
+        if r["city"] and r["dist"]:
+            if r["city"] + r["dist"] in body:
+                full.append((len(r["city"] + r["dist"]), r))
+        elif r["dist"] and r["dist"] in body:
+            full.append((len(r["dist"]), r))
+    if full:
+        full.sort(key=lambda x: -x[0])
+        r = full[0][1]
+        return {"zip": r["zip"], "city": r["city"], "district": r["dist"], "fill": False, "error": ""}
+
+    # 2. 只寫區名（區名要帶「區鄉鎮市」，避免「光復路」被當成光復鄉）
+    hits = []
+    for r in rows:
+        d = r["dist"]
+        if not d or d == r["city"]:
+            continue
+        base = d[:-1] if d[-1] in "區鄉鎮市" and len(d) > 2 else d
+        pat = re.escape(d) if len(d) <= 2 and d[-1] in "區鄉鎮市" else re.escape(base) + "[區鄉鎮市]"
+        m = re.search(pat, body)
+        if m:
+            hits.append((m.start(), m.group(0), r))
+    if hits:
+        pos = min(h[0] for h in hits)
+        hits = [h for h in hits if h[0] == pos]
+        prefix = body[:pos]
+        named = [c for c in _CITY_SHORT if c in prefix]
+        same_city = [h for h in hits if _city_short(h[2]["city"]) in named] if named else hits
+        if named and not same_city:
+            d = hits[0][1]
+            owners = "／".join(sorted({h[2]["city"] for h in hits}))
+            return {"zip": None, "error": f"「{d}」不在{named[-1]}，是{owners}的區，請確認縣市"}
+        cities = sorted({h[2]["city"] for h in same_city})
+        if len(cities) > 1:
+            d = same_city[0][1]
+            return {"zip": None, "error": f"「{d}」有好幾個：{'／'.join(cities)}，請在前面寫縣市（例：{_city_short(cities[0])}{d}）"}
+        h = same_city[0]
+        return {"zip": h[2]["zip"], "city": h[2]["city"], "district": h[1], "fill": True, "pos": pos, "error": ""}
+
+    # 3. 只寫縣市：整個縣市只有一個郵遞區號（新竹市 300、嘉義市 600）就收
+    city_zips: Dict[str, set] = {}
+    for r in rows:
+        if r["city"]:
+            city_zips.setdefault(r["city"], set()).add(r["zip"])
+    head = body[:8]
+    found = [c for c in sorted(city_zips, key=len, reverse=True) if c in head]
+    for c in found:
+        if len(city_zips[c]) == 1:
+            return {"zip": next(iter(city_zips[c])), "city": c, "district": "", "fill": False, "error": ""}
+    if found:
+        c = found[0]
+        return {"zip": None, "error": f"{c}要寫到區（例：{c}{_example_district(rows, c)}）"}
+    for c in _CITY_SHORT:
+        if body.startswith(c):
+            full_city = next((x for x in city_zips if _city_short(x) == c), c)
+            return {"zip": None, "error": f"{full_city}要寫到區（例：{full_city}{_example_district(rows, full_city)}）"}
+
+    return {"zip": None, "error": "找不到縣市或鄉鎮區（例：台南市北區○○路1號）"}
+
+
+def _example_district(rows, city: str) -> str:
+    for r in rows:
+        if r["city"] == city and r["dist"] and r["dist"] != city and r["dist"][-1] in "區鄉鎮市":
+            return r["dist"]
+    return "○○區" if city.endswith("市") else "○○鄉"
+
+
+def _complete_address(address: str, res: Dict[str, Any]) -> str:
+    """只打區名時，把縣市補到地址前面（區名前面的雜字一起換掉，例：北市文山區→台北市文山區）"""
+    if not res.get("fill"):
+        return address
+    addr = _normalize_address_for_compare(address)
+    body = re.sub(r"^\d{3,6}", "", addr)
+    return res["city"] + body[res.get("pos", 0):]
+
 
 def _find_zip_code(address: str) -> Optional[str]:
-    """查詢郵遞區號（支援縣市+區域匹配，最長匹配優先）"""
-    try:
-        ws = _ws(ZIPREF_SHEET_NAME)
-        rows = ws.get_all_records()
-        
-        # 正規化地址
-        address_normalized = _normalize_address_for_compare(address)
-        
-        # 收集所有匹配的區域，並按長度排序（最長優先）
-        matches = []
-        for row in rows:
-            # 支援兩種格式：
-            # 格式1: 只有「區域」欄位（例：台南市北區）
-            # 格式2: 分別有「縣市」和「區域」欄位
-            
-            city = str(row.get("縣市", "")).strip()
-            district = str(row.get("區域", "")).strip()
-            zip_code = str(row.get("郵遞區號", "")).strip()
-            
-            if not zip_code:
-                continue
-            
-            # 建構完整區域名稱
-            if city and district:
-                # 格式2: 縣市 + 區域
-                full_district = f"{city}{district}"
-            elif district:
-                # 格式1: 只有區域
-                full_district = district
-            else:
-                continue
-            
-            # 正規化並比對
-            full_district_normalized = _normalize_address_for_compare(full_district)
-            
-            if full_district_normalized in address_normalized:
-                matches.append((len(full_district_normalized), zip_code, full_district))
-        
-        if matches:
-            # 按匹配長度降序排序，取最長的
-            matches.sort(key=lambda x: x[0], reverse=True)
-            best_match = matches[0]
-            app.logger.info(f"[ZIP] 找到郵遞區號 {best_match[1]} for {best_match[2]} (原地址: {address})")
-            return best_match[1]
-        
-        app.logger.warning(f"[ZIP] 找不到郵遞區號: {address}")
-        return None
-    except Exception as e:
-        app.logger.error(f"[ZIP] 查詢失敗: {e}")
-        return None
+    """查詢郵遞區號（相容舊呼叫）"""
+    return _resolve_zip(address).get("zip")
+
 
 # ============================================
 # OCR 會話管理
@@ -775,484 +1003,340 @@ def _write_ocr_results(pairs: List[Tuple[str, str]], event) -> str:
 # ============================================
 # 寄書功能（含驗證與引導修正）
 # ============================================
-def _validate_order_data(data: Dict[str, str]) -> Dict[str, List[str]]:
-    """驗證寄書資料，只回傳真正有問題的欄位（支援多書逐本確認）"""
-    errors = {
-        "name": [],
-        "phone": [],
-        "address": [],
-        "books": []
-    }
-    
-    # 驗證姓名：有填就好
-    name = data.get("name", "").strip()
+# 寄書建單（2026-11-13 改寫）
+# 一次檢查完姓名／電話／地址／書名，能自動校正的直接校正並在回覆裡說明；
+# 只有真的拿不準的書才問，可一次選多本、可直接打書名、可略過
+# ============================================
+PENDING_TTL_SEC = 30 * 60
+
+
+def _reply(event, text: str):
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+
+
+def _extract_mobile(raw: str) -> Tuple[Optional[str], str, str]:
+    """從電話欄抓出第一支手機；回傳 (手機, 其他附註, 錯誤訊息)"""
+    s = unicodedata.normalize("NFKC", raw or "").strip()
+    if not s:
+        return None, "", "電話為必填"
+    m = re.search(r"09\d{2}[-\s]?\d{3}[-\s]?\d{3}(?!\d)", s)
+    if m:
+        phone = re.sub(r"\D", "", m.group(0))
+        extra = (s[:m.start()] + " " + s[m.end():]).strip(" /,、，()（）-")
+        return phone, extra, ""
+    digits = re.sub(r"\D", "", s)
+    if digits.startswith("09") and len(digits) != 10:
+        return None, "", f"電話「{raw}」是 {len(digits)} 碼，手機應該是 10 碼"
+    return None, "", f"電話格式錯誤：「{raw}」（需為 09 開頭的 10 碼手機號碼）"
+
+
+def _check_address_suspicious(address: str) -> List[str]:
+    """建單前地址檢查，回傳問題清單（空＝正常）"""
+    issues = []
+    if re.search(r"\d\s+\d", address):
+        issues.append("數字中間被斷開，可能少了「巷／弄／之」")
+    if "號" not in address:
+        issues.append("缺少門牌「號」")
+    return issues
+
+
+def _prepare_order(name: str, phone_raw: str, address_raw: str, book_raw: str, biz_note: str) -> Dict[str, Any]:
+    """檢查並整理一張寄書單；errors 為空才可以建單"""
+    errors: List[str] = []
+    notes: List[str] = [biz_note] if biz_note else []
+    order: Dict[str, Any] = {"name": name, "biz_note": biz_note}
+
     if not name:
-        errors["name"].append("姓名為必填")
-    
-    # 驗證電話：09 開頭 + 10 位數
-    phone_raw = data.get("phone", "").strip()
-    if not phone_raw:
-        errors["phone"].append("電話為必填")
+        errors.append("姓名為必填")
+
+    phone, extra, perr = _extract_mobile(phone_raw)
+    if perr:
+        errors.append(perr)
+    elif extra:
+        notes.append(f"電話備註：{extra}")
+    order["phone"] = phone
+
+    # 地址
+    order["address"] = address_raw
+    order["method"] = ""
+    order["addr_fixed"] = False
+    if not address_raw:
+        errors.append("地址為必填")
     else:
-        phone = normalize_phone(phone_raw)
-        if not phone:
-            errors["phone"].append(f"電話格式錯誤：「{phone_raw}」（需為 09 開頭的 10 碼手機號碼）")
-    
-    # 驗證地址：檢查是否為超商、自取、或是否有郵遞區號
-    address = data.get("address", "").strip()
-    if not address:
-        errors["address"].append("地址為必填")
-    else:
-        # 檢查是否為超商或自取
-        delivery_method = detect_delivery_method(address)
-        if delivery_method:
-            # 是超商或自取，放行
-            app.logger.info(f"[VALIDATION] 偵測到寄送方式: {delivery_method}")
+        method = detect_delivery_method(address_raw)
+        if method:
+            order["method"] = method
+            # 跟舊版一樣：超商地址裡查得到郵遞區號就加在前面（不重複加）
+            res = _resolve_zip(address_raw) if method != "自取" else {}
+            if res.get("zip") and not res.get("fill") and WRITE_ZIP_TO_ADDRESS:
+                order["address"] = f"{res['zip']} " + re.sub(r"^\d{3,6}\s*", "", address_raw.strip())
         else:
-            # 不是超商或自取，需要郵遞區號
-            zip_code = _find_zip_code(address)
-            if not zip_code:
-                errors["address"].append(f"找不到郵遞區號：「{address}」（請補充完整地址含區域，例：台南市北區）")
-    
-    # 驗證書籍（收集所有錯誤書名，但不立即提示建議）
-    book_raw = data.get("book", "").strip()
+            res = _resolve_zip(address_raw)
+            if not res.get("zip"):
+                if _looks_like_unbranded_store(address_raw):
+                    errors.append(f"「{address_raw}」看起來是超商門市，請寫是哪一家（例：全家汐止力行店、7-11 湖西門市）")
+                else:
+                    errors.append(f"地址「{address_raw}」：{res['error']}")
+            else:
+                if res.get("fill"):
+                    full = _complete_address(address_raw, res)
+                else:
+                    full = re.sub(r"^\d{3,6}\s*", "", address_raw.strip())
+                issues = _check_address_suspicious(full)
+                if issues:
+                    issue_str = "、".join(issues)
+                    app.logger.warning(f"[ADDR_CHECK] 可疑地址: {full} | {issue_str}")
+                    errors.append(f"地址可能有誤：「{full}」（{issue_str}）")
+                order["method"] = "便利帶"
+                order["addr_fixed"] = bool(res.get("fill"))
+                order["address"] = f"{res['zip']} {full}" if WRITE_ZIP_TO_ADDRESS else full
+
+    # 書名
+    items = []
     if not book_raw:
-        errors["books"].append("書籍名稱為必填")
+        errors.append("書籍名稱為必填")
     else:
-        book_names = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw) if x.strip()]
-        invalid_books = []
-        
-        for book_name in book_names:
-            matched = _find_book_exact(book_name)
-            if not matched:
-                invalid_books.append(book_name)
-        
-        if invalid_books:
-            # 只記錄錯誤的書名，不在這裡產生建議
-            errors["books"] = invalid_books
-    
-    # 移除空錯誤（只回傳真正有問題的）
-    return {k: v for k, v in errors.items() if v}
+        for seg in _split_books(book_raw):
+            r = _resolve_book(seg)
+            item = {"raw": seg, "status": r["status"], "book": r.get("book"),
+                    "cands": r.get("cands", []), "changed": r.get("changed", False)}
+            if r.get("guess_current") and re.search(r"英|日|韓|德|法|西|多益|兒|美|文|語", seg):
+                notes.append(f"書名原文：{seg}")
+            items.append(item)
+    order["items"] = items
+    order["note"] = "；".join(n for n in notes if n)
+    order["errors"] = errors
+    return order
 
-def _format_validation_errors_simple(errors: Dict[str, List]) -> str:
-    """格式化簡單驗證錯誤訊息（姓名、電話、地址）"""
-    lines = ["❌ 發現以下問題：\n"]
-    error_num = 1
-    
-    if "name" in errors:
-        for err in errors["name"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    if "phone" in errors:
-        for err in errors["phone"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    if "address" in errors:
-        for err in errors["address"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    lines.append("\n請重新輸入完整 #寄書 資料")
-    return "\n".join(lines)
 
-def _start_book_selection(event, validation_data: Dict, invalid_books: List[str], biz_note: str):
-    """啟動逐本選書流程（新功能）"""
-    user_id = event.source.user_id
-    
-    # 為每本錯誤的書找建議
-    books_with_suggestions = []
-    for wrong_name in invalid_books:
-        suggestions = _suggest_books(wrong_name)
-        books_with_suggestions.append({
-            "wrong": wrong_name,
-            "suggestions": suggestions
-        })
-    
-    # 找到第一本有建議的書
-    current_book = None
-    for book_info in books_with_suggestions:
-        if book_info["suggestions"]:
-            current_book = book_info
-            break
-    
-    if not current_book:
-        # 所有書都找不到建議
-        msg = "❌ 找不到以下書籍：\n"
-        msg += "\n".join([f"• {b['wrong']}" for b in books_with_suggestions])
-        msg += "\n\n請使用「#查書名」確認正確書名"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        return
-    
-    # 儲存選書狀態（加入超時機制）
-    _PENDING[user_id] = {
+def _book_problem_hint(items: List[Dict[str, Any]]) -> List[str]:
+    out = []
+    for it in items:
+        if it["status"] == "ask":
+            out.append(f"• 書名「{it['raw']}」可能是：" + "／".join(it["cands"][:4]))
+        elif it["status"] == "none":
+            out.append(f"• 書名「{it['raw']}」找不到，可用「#查書名 關鍵字」查")
+    return out
+
+
+def _pending_book_items(order) -> List[int]:
+    return [i for i, it in enumerate(order["items"]) if it["status"] in ("ask", "none")]
+
+
+def _start_book_selection(event, order: Dict[str, Any]):
+    _PENDING[event.source.user_id] = {
         "type": "book_selection_step",
-        "expire_at": time.time() + 300,  # 5分鐘超時
-        "validation_data": validation_data,
-        "biz_note": biz_note,
-        "all_books": books_with_suggestions,
-        "current_index": 0,
-        "selected_books": []
+        "expire_at": time.time() + PENDING_TTL_SEC,
+        "order": order,
     }
-    
-    # 顯示第一本書的選單
-    _show_book_selection_prompt(event, current_book, 1, len(books_with_suggestions))
+    _show_book_selection_prompt(event, order)
 
-def _show_book_selection_prompt(event, book_info: Dict, current: int, total: int):
-    """顯示選書提示（新函式）"""
-    lines = [f"❌ 找不到書籍：「{book_info['wrong']}」（第 {current}/{total} 本）\n"]
-    
-    if book_info["suggestions"]:
-        lines.append("💡 建議書籍：")
-        for i, sugg in enumerate(book_info["suggestions"], start=1):
-            lines.append(f"[{i}] {sugg}")
-    
-    lines.append("\n請回覆數字選擇，或回覆「取消」結束")
-    
-    msg = "\n".join(lines)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+
+def _show_book_selection_prompt(event, order: Dict[str, Any], prefix: str = ""):
+    todo = _pending_book_items(order)
+    it = order["items"][todo[0]]
+    total = len(todo)
+    more = f"（共 {total} 本要確認）" if total > 1 else ""
+    lines = [prefix] if prefix else []
+    if it["status"] == "ask":
+        lines.append(f"📚 「{it['raw']}」要寄哪一本？{more}")
+        for i, c in enumerate(it["cands"], start=1):
+            lines.append(f"[{i}] {c}")
+        lines.append("")
+        lines.append("回覆編號；要多本可回「1 2」或「全部」")
+    else:
+        lines.append(f"📚 找不到「{it['raw']}」{more}")
+        lines.append("可先用「#查書名 關鍵字」查")
+    lines.append("也可以直接打書名、回「略過」不寄這本，或「取消」")
+    _reply(event, "\n".join(lines))
+
 
 def _handle_book_selection_step(event, text: str) -> bool:
-    """處理逐本選書流程（新函式）"""
+    """處理選書回覆"""
     user_id = event.source.user_id
     pend = _PENDING.get(user_id)
-    
     if not pend or pend.get("type") != "book_selection_step":
         return False
-    
-    # 檢查超時
     if time.time() > pend.get("expire_at", 0):
         _PENDING.pop(user_id, None)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⏱️ 選書流程已超時，請重新輸入 #寄書"))
+        _reply(event, "⏱️ 選書已超過 30 分鐘，請重新送出 #寄書")
         return True
-    
-    ans = text.strip().upper()
-    
-    # 取消
-    if ans in ("取消", "CANCEL", "N"):
+    pend["expire_at"] = time.time() + PENDING_TTL_SEC
+
+    order = pend["order"]
+    todo = _pending_book_items(order)
+    it = order["items"][todo[0]]
+    ans = unicodedata.normalize("NFKC", text).strip()
+    ans_clean = re.sub(r"[\[\]【】]", "", ans).strip()
+
+    if ans_clean.upper() in ("取消", "CANCEL", "N", "NO"):
         _PENDING.pop(user_id, None)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消選書流程"))
-        return True
-    
-    # 檢查是否為數字
-    if not ans.isdigit():
-        return False
-    
-    choice = int(ans)
-    current_index = pend["current_index"]
-    all_books = pend["all_books"]
-    current_book = all_books[current_index]
-    
-    # 檢查選擇是否有效
-    if choice < 1 or choice > len(current_book["suggestions"]):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 無效的選項，請選擇 1-{len(current_book['suggestions'])}"))
-        return True
-    
-    # 記錄選擇
-    selected = current_book["suggestions"][choice - 1]
-    pend["selected_books"].append(selected)
-    app.logger.info(f"[BOOK] 使用者選擇：{current_book['wrong']} → {selected}")
-    
-    # 移到下一本
-    next_index = current_index + 1
-    
-    # 找下一本有建議的書
-    next_book = None
-    while next_index < len(all_books):
-        if all_books[next_index]["suggestions"]:
-            next_book = all_books[next_index]
-            pend["current_index"] = next_index
-            break
-        next_index += 1
-    
-    if next_book:
-        # 還有下一本，繼續選
-        _show_book_selection_prompt(event, next_book, next_index + 1, len(all_books))
-        return True
-    else:
-        # 全部選完，建立訂單
-        validation_data = pend["validation_data"]
-        biz_note = pend["biz_note"]
-        
-        # 組合最終書名（包含已選擇的和原本正確的）
-        original_books = [x.strip() for x in re.split(r"[,，、;；\n]+", validation_data["book"]) if x.strip()]
-        final_books = []
-        
-        selected_index = 0
-        for book_name in original_books:
-            matched = _find_book_exact(book_name)
-            if matched:
-                final_books.append(matched)
-            else:
-                if selected_index < len(pend["selected_books"]):
-                    final_books.append(pend["selected_books"][selected_index])
-                    selected_index += 1
-        
-        final_book_str = "、".join(final_books)
-        
-        _PENDING.pop(user_id, None)
-        _create_order_confirmed(
-            event,
-            validation_data["name"],
-            validation_data["phone"],
-            validation_data["address"],
-            final_book_str,
-            biz_note
-        )
+        _reply(event, "已取消，這張寄書沒有建立")
         return True
 
-def _format_validation_errors(errors: Dict[str, List]) -> str:
-    """格式化驗證錯誤訊息（只顯示真正有問題的欄位）"""
-    lines = ["❌ 發現以下問題：\n"]
-    error_num = 1
-    
-    # 姓名錯誤
-    if "name" in errors:
-        for err in errors["name"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    # 電話錯誤
-    if "phone" in errors:
-        for err in errors["phone"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    # 地址錯誤
-    if "address" in errors:
-        for err in errors["address"]:
-            lines.append(f"{error_num}. {err}")
-            error_num += 1
-    
-    # 書籍錯誤
-    if "books" in errors:
-        for err_item in errors["books"]:
-            if isinstance(err_item, dict):
-                wrong = err_item["wrong"]
-                suggestions = err_item["suggestions"]
-                lines.append(f"{error_num}. 書籍名稱錯誤：「{wrong}」")
-                if suggestions:
-                    lines.append("   → 建議書籍：")
-                    for i, sugg in enumerate(suggestions, start=1):
-                        lines.append(f"     [{i}] {sugg}")
-                else:
-                    lines.append("   → 找不到相似書籍，請使用「#查書名」確認")
-                error_num += 1
-            else:
-                lines.append(f"{error_num}. {err_item}")
-                error_num += 1
-    
-    lines.append("\n---")
-    lines.append("📝 修正方式：")
-    
-    # 根據錯誤類型給予不同提示
-    if "books" in errors and any(isinstance(e, dict) and e.get("suggestions") for e in errors["books"]):
-        lines.append("• 書籍請回覆數字選擇（例：1）")
-    
-    if "name" in errors or "phone" in errors or "address" in errors:
-        lines.append("• 請重新輸入完整 #寄書 資料（含修正項目）")
-    
-    lines.append("• 或回覆「N」取消本次登記")
-    
-    return "\n".join(lines)
+    if ans_clean in ("略過", "跳過", "不要", "不寄"):
+        it["status"] = "skip"
+    elif ans_clean in ("全部", "都要", "全選") and it["status"] == "ask":
+        it["status"] = "multi"
+        it["books"] = list(it["cands"])
+    elif re.fullmatch(r"\d+([\s,、，]+\d+)*", ans_clean) and it["status"] == "ask":
+        nums = [int(x) for x in re.split(r"[\s,、，]+", ans_clean)]
+        if any(n < 1 or n > len(it["cands"]) for n in nums):
+            _reply(event, f"❌ 請回 1～{len(it['cands'])} 的編號")
+            return True
+        picked = []
+        for n in nums:
+            if it["cands"][n - 1] not in picked:
+                picked.append(it["cands"][n - 1])
+        it["status"] = "multi"
+        it["books"] = picked
+    else:
+        r = _resolve_book(ans)
+        if r["status"] == "ok":
+            it["status"] = "multi"
+            it["books"] = [r["book"]]
+        elif r["status"] == "ask":
+            it["status"] = "ask"
+            it["raw"] = ans
+            it["cands"] = r["cands"]
+            _show_book_selection_prompt(event, order)
+            return True
+        else:
+            _show_book_selection_prompt(event, order, prefix=f"❌ 還是找不到「{ans}」")
+            return True
+
+    if _pending_book_items(order):
+        _show_book_selection_prompt(event, order)
+        return True
+
+    _PENDING.pop(user_id, None)
+    if not _final_books(order):
+        _reply(event, "所有書都略過了，這張寄書沒有建立")
+        return True
+    _create_order_confirmed(event, order)
+    return True
+
+
+def _final_books(order: Dict[str, Any]) -> List[str]:
+    out = []
+    for it in order["items"]:
+        if it["status"] == "ok":
+            out.append(it["book"])
+        elif it["status"] == "multi":
+            out.extend(it["books"])
+    return out
+
 
 def _handle_new_order(event, text: str):
-    """處理新寄書（含驗證，支援逐本確認）"""
-    user_id = event.source.user_id
-    
-    # 檢查是否有未完成的流程
-    if user_id in _PENDING:
-        pend_type = _PENDING[user_id].get("type", "")
-        if pend_type == "book_selection_step":
-            msg = "⚠️ 您有未完成的選書流程\n\n回覆「取消」可清除，或繼續完成選書"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-            return
-    
-    lines_after = text.replace("#寄書", "").strip()
+    """處理新寄書"""
+    lines_after = re.sub(r"^[#＃]\s*寄書", "", text.strip()).strip()
     data = parse_kv_lines(lines_after)
-    
-    name = data.get("姓名", "").strip()
-    phone_raw = data.get("電話", "").strip()
-    address_raw = data.get("寄送地址", "").strip()
-    book_raw = data.get("書籍名稱", "").strip()
-    biz_note = data.get("業務備註", "").strip()
-    
-    # 驗證資料
-    validation_data = {
-        "name": name,
-        "phone": phone_raw,
-        "address": address_raw,
-        "book": book_raw
-    }
-    
-    errors = _validate_order_data(validation_data)
-    
-    # 如果有姓名、電話、地址錯誤，直接提示
-    if "name" in errors or "phone" in errors or "address" in errors:
-        error_msg = _format_validation_errors_simple(errors)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
-        return
-    
-    # 如果有書籍錯誤，啟動逐本確認流程
-    if "books" in errors:
-        invalid_books = errors["books"]
-        _start_book_selection(event, validation_data, invalid_books, biz_note)
-        return
-    
-    # 無錯誤，直接建立訂單
-    _create_order_confirmed(event, name, phone_raw, address_raw, book_raw, biz_note)
 
-def _create_order_confirmed(event, name: str, phone_raw: str, address_raw: str, book_raw: str, biz_note: str):
-    """確認無誤後建立訂單（根據實際表頭動態寫入）"""
+    order = _prepare_order(
+        data.get("姓名", "").strip(),
+        data.get("電話", "").strip(),
+        data.get("寄送地址", "").strip(),
+        data.get("書籍名稱", "").strip(),
+        data.get("業務備註", "").strip(),
+    )
+
+    if order["errors"]:
+        lines = ["⚠️ 尚未建單，請修正後重新送出 #寄書", ""]
+        for i, e in enumerate(order["errors"], start=1):
+            lines.append(f"{i}. {e}")
+        hint = _book_problem_hint(order["items"])
+        if hint:
+            lines.append("")
+            lines.append("另外書名也要確認：")
+            lines.extend(hint)
+        _reply(event, "\n".join(lines))
+        return
+
+    if _pending_book_items(order):
+        _start_book_selection(event, order)
+        return
+
+    _create_order_confirmed(event, order)
+
+
+def _create_order_confirmed(event, order: Dict[str, Any]):
+    """寫入寄書任務（一次插入整張單的所有書）"""
     try:
         uid = getattr(event.source, "user_id", "")
         profile = line_bot_api.get_profile(uid)
         operator = profile.display_name or "系統"
     except Exception:
         operator = "系統"
-    
-    app.logger.info(f"[ORDER] 開始建立訂單 - 姓名:{name}, 電話:{phone_raw}, 書籍:{book_raw}")
-    
-    phone = normalize_phone(phone_raw)
-    zip_code = _find_zip_code(address_raw)
-    
-    if WRITE_ZIP_TO_ADDRESS and zip_code:
-        address = f"{zip_code} {address_raw}"
-    else:
-        address = address_raw
-    
-    app.logger.info(f"[ORDER] 處理後 - 電話:{phone}, 郵遞區號:{zip_code}, 地址:{address}")
-    
-    # 解析書名
-    book_names = [x.strip() for x in re.split(r"[,，、;；\n]+", book_raw) if x.strip()]
-    final_books = []
-    for book_name in book_names:
-        matched = _find_book_exact(book_name)
-        if matched:
-            final_books.append(matched)
-        else:
-            final_books.append(book_name)
-    
-    app.logger.info(f"[ORDER] 解析書名完成: {final_books}")
-    
+
+    name = order["name"]
+    phone = order["phone"]
+    address = order["address"]
+    final_books = _final_books(order)
+    app.logger.info(f"[ORDER] 建立訂單 - 姓名:{name}, 電話:{phone}, 地址:{address}, 書籍:{final_books}")
+
     try:
-        app.logger.info(f"[ORDER] 準備寫入工作表: {MAIN_SHEET_NAME}")
         ws = _ws(MAIN_SHEET_NAME)
         h = _get_header_map(ws)
-        app.logger.info(f"[ORDER] 表頭對應: {h}")
-        
         all_vals = ws.get_all_values()
         header = all_vals[0] if all_vals else []
-        app.logger.info(f"[ORDER] 實際表頭: {header}")
-        app.logger.info(f"[ORDER] 目前資料列數: {len(all_vals)}")
-        
-        # 生成新 ID
-        # 支援多種 ID 欄位名稱
+
         idx_rid = _col_idx(h, "寄書ID", _col_idx(h, "紀錄ID", 1))
-        existing_ids = [r[idx_rid - 1] for r in all_vals[1:] if len(r) >= idx_rid and r[idx_rid - 1].startswith("R")]
         max_num = 0
-        for eid in existing_ids:
-            m = re.match(r"R(\d+)", eid)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
+        for r in all_vals[1:]:
+            if len(r) >= idx_rid:
+                m = re.match(r"R(\d+)", r[idx_rid - 1] or "")
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
         new_rid = f"R{max_num + 1:04d}"
-        
-        app.logger.info(f"[ORDER] 生成新ID: {new_rid} (目前最大編號: {max_num})")
-        
-        # 根據表頭欄位數量建立空白列
-        num_cols = len(header)
-        
-        # 寫入多列
+        now_s = now_str_min()
+
+        def put(row, keys, value):
+            for k in keys:
+                if k in h:
+                    row[h[k] - 1] = value
+                    return
+
+        rows = []
         for book in final_books:
-            # 建立空白列（填滿所有欄位）
-            row = [""] * num_cols
-            
-            # 根據表頭名稱填入對應資料
-            # ID 欄位
-            if "寄書ID" in h:
-                row[h["寄書ID"] - 1] = new_rid
-            elif "紀錄ID" in h:
-                row[h["紀錄ID"] - 1] = new_rid
-            
-            # 建單日期（使用 yyyy-mm-dd hh:mm 格式）
-            if "建單日期" in h:
-                row[h["建單日期"] - 1] = now_str_min()  # 使用完整時間格式
-            elif "建單時間" in h:
-                row[h["建單時間"] - 1] = now_str_min()
-            
-            # 建單人
-            if "建單人" in h:
-                row[h["建單人"] - 1] = operator
-            
-            # 姓名
-            if "學員姓名" in h:
-                row[h["學員姓名"] - 1] = name
-            elif "姓名" in h:
-                row[h["姓名"] - 1] = name
-            
-            # 電話（加上單引號強制文字格式，避免開頭 0 被移除）
-            if "學員電話" in h:
-                row[h["學員電話"] - 1] = f"'{phone}" if phone else ""
-            elif "電話" in h:
-                row[h["電話"] - 1] = f"'{phone}" if phone else ""
-            
-            # 地址
-            if "寄送地址" in h:
-                row[h["寄送地址"] - 1] = address
-            elif "地址" in h:
-                row[h["地址"] - 1] = address
-            
-            # 書籍
-            if "書籍名稱" in h:
-                row[h["書籍名稱"] - 1] = book
-            
-            # 業務備註
-            if "業務備註" in h:
-                row[h["業務備註"] - 1] = biz_note
-            
-            # 寄送方式（根據原始地址判別，避免郵遞區號誤觸超商關鍵字）
-            if "寄送方式" in h:
-                delivery_method = detect_delivery_method(address_raw)
-                if delivery_method:
-                    # 偵測到超商
-                    row[h["寄送方式"] - 1] = delivery_method
-                elif address:
-                    # 有地址但不是超商 → 便利帶
-                    row[h["寄送方式"] - 1] = "便利帶"
-                else:
-                    row[h["寄送方式"] - 1] = ""
-            
-            # 經手人（建單時不填，出貨時才填）
-            if "經手人" in h:
-                row[h["經手人"] - 1] = ""
-            elif "已託運-經手人" in h:
-                row[h["已託運-經手人"] - 1] = ""
-            
-            # 狀態
-            if "寄送狀態" in h:
-                row[h["寄送狀態"] - 1] = "待處理"
-            elif "狀態" in h:
-                row[h["狀態"] - 1] = "待處理"
-            
-            app.logger.info(f"[ORDER] 準備寫入: {row[:5]}... (共 {len(row)} 欄)")
-            _safe_append_row(ws, row)
-            app.logger.info(f"[ORDER] ✅ 成功建立寄書 {new_rid}: {name} / {book}")
-        
+            row = [""] * len(header)
+            put(row, ["寄書ID", "紀錄ID"], new_rid)
+            put(row, ["建單日期", "建單時間"], now_s)
+            put(row, ["建單人"], operator)
+            put(row, ["學員姓名", "姓名"], name)
+            put(row, ["學員電話", "電話"], f"'{phone}" if phone else "")
+            put(row, ["寄送地址", "地址"], address)
+            put(row, ["書籍名稱"], book)
+            put(row, ["業務備註"], order.get("note", ""))
+            put(row, ["寄送方式"], order.get("method", ""))
+            put(row, ["寄送狀態", "狀態"], "待處理")
+            rows.append(row)
+
+        ws.insert_rows(rows, row=2, value_input_option="USER_ENTERED", inherit_from_before=False)
+        app.logger.info(f"[ORDER] 成功建立寄書 {new_rid}: {name} / {final_books}")
+
         msg_lines = ["✅ 寄書建立完成"]
-        msg_lines.append(f"建單日期：{now_str_min()}")
+        msg_lines.append(f"建單日期：{now_s}")
         msg_lines.append(f"姓名：{name}  |  電話：{phone}")
         msg_lines.append(f"地址：{address}")
         msg_lines.append(f"書籍：{', '.join(final_books)}")
         msg_lines.append("狀態：待處理")
-        
-        msg = "\n".join(msg_lines)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        app.logger.info(f"[ORDER] 訂單建立完成，已回覆使用者")
+        fixes = []
+        if order.get("addr_fixed"):
+            fixes.append("地址已補上縣市")
+        for it in order["items"]:
+            if it["status"] == "ok" and it.get("changed") and _norm_book(it["raw"]) != _norm_book(it["book"]):
+                fixes.append(f"「{it['raw']}」→ {it['book']}")
+        if fixes:
+            msg_lines.append("")
+            msg_lines.append("🔎 自動對應：")
+            msg_lines.extend(f"• {f}" for f in fixes)
+        if order.get("note") and order.get("note") != order.get("biz_note"):
+            msg_lines.append(f"備註：{order['note']}")
+        _reply(event, "\n".join(msg_lines))
     except Exception as e:
-        app.logger.error(f"[ORDER] ❌ 建立失敗: {e}", exc_info=True)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ 建立失敗: {e}"))
-        raise
+        app.logger.error(f"[ORDER] 建立失敗: {e}", exc_info=True)
+        _reply(event, "❌ 寄書建立失敗，Google 表可能暫時連不上，請過一分鐘再送一次")
+
 
 # ============================================
 # 查詢寄書
@@ -1526,6 +1610,7 @@ def _handle_cancel_request(event, text: str):
         # 儲存待確認
         _PENDING[event.source.user_id] = {
             "type": "cancel_order",
+            "expire_at": time.time() + CONFIRM_TTL_SEC,
             "sheet": MAIN_SHEET_NAME,
             "rid": rid,
             "stu": stu_name,
@@ -1569,17 +1654,27 @@ def _handle_delete_ship(event, text: str):
         idx_status = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
         
         found = False
+        changed = 0
+        other_status = set()
         for i, r in enumerate(all_vals[1:], start=2):
             if len(r) >= idx_rid and r[idx_rid - 1] == rid:
+                found = True
+                status = (r[idx_status - 1] if len(r) >= idx_status else "").strip()
+                # 只撤銷「已託運」的列；已刪除、待處理的不動（避免刪掉的單又活回來）
+                if status != "已託運":
+                    other_status.add(status or "空白")
+                    continue
                 _safe_update_cell(ws, i, idx_tracking, "")
                 _safe_update_cell(ws, i, idx_date, "")
                 _safe_update_cell(ws, i, idx_person, "")
                 _safe_update_cell(ws, i, idx_status, "待處理")
-                found = True
-        
-        if found:
-            app.logger.info(f"[DELETE_SHIP] 已撤銷出書: {rid}")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已撤銷 {rid} 的出貨記錄"))
+                changed += 1
+
+        if changed:
+            app.logger.info(f"[DELETE_SHIP] 已撤銷出書: {rid} {changed} 列")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已撤銷 {rid} 的出貨記錄（{changed} 本）"))
+        elif found:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ {rid} 狀態是「{'、'.join(sorted(other_status))}」，不是已託運，沒有更動"))
         else:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"找不到寄書ID：{rid}"))
     except Exception as e:
@@ -1715,6 +1810,7 @@ def _handle_stockin(event, text: str):
     # 儲存待確認
     _PENDING[event.source.user_id] = {
         "type": "stock_in_confirm",
+        "expire_at": time.time() + CONFIRM_TTL_SEC,
         "operator": operator,
         "items": final_items
     }
@@ -1842,6 +1938,7 @@ def _finalize_stockin_items(event, pend):
     
     # 更新為確認狀態
     pend["type"] = "stock_in_confirm"
+    pend["expire_at"] = time.time() + CONFIRM_TTL_SEC
     pend["items"] = final_items
     pend.pop("errors", None)
     
@@ -1934,6 +2031,7 @@ def _handle_organize_order(event, text: str):
     
     _PENDING[event.source.user_id] = {
         "type": "organize_order_confirm",
+        "expire_at": time.time() + CONFIRM_TTL_SEC,
         "data": {
             "name": name,
             "phone": phone,
@@ -1947,78 +2045,78 @@ def _handle_organize_order(event, text: str):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 # ============================================
-# 處理待確認回答（修復 S2：移除重複程式碼）
+# 處理待確認回答
 # ============================================
+CONFIRM_TTL_SEC = 10 * 60
+
+
 def _handle_pending_answer(event, text: str) -> bool:
     """處理待確認回答"""
     user_id = event.source.user_id
     pend = _PENDING.get(user_id)
     if not pend:
         return False
-    
-    # 處理逐本選書流程（新增）
+
+    # 處理逐本選書流程
     if pend.get("type") == "book_selection_step":
         return _handle_book_selection_step(event, text)
-    
-    ans = text.strip().upper()
-    
-    # 取消
-    if ans == "N":
+
+    # 確認類（取消寄書、入庫、整理寄書）超過 10 分鐘就作廢，避免隔很久回一句 OK 被當成確認
+    if pend.get("type") != "stockin_correction" and time.time() > pend.get("expire_at", time.time() + 1):
         _PENDING.pop(user_id, None)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消。"))
+        return False
+
+    ans = unicodedata.normalize("NFKC", text).strip().upper()
+
+    # 取消
+    if ans in ("N", "NO", "取消"):
+        _PENDING.pop(user_id, None)
+        _reply(event, "已取消。")
         return True
-    
-    # 處理書籍選擇（數字）
-    if pend.get("type") == "order_correction" and ans.isdigit():
-        return _handle_book_selection(event, int(ans))
-    
+
     # 處理入庫修正（數字選擇或輸入書名）
     if pend.get("type") == "stockin_correction":
         return _handle_stockin_correction(event, text)
-    
-    # 重新輸入
-    if ans in ("重新輸入", "RETRY", "REDO"):
-        _PENDING.pop(event.source.user_id, None)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已清除，請重新輸入完整 #寄書 資料"))
-        return True
-    
+
     # 確認
     if ans not in ("Y", "YES", "OK"):
         return False
-    
-    # 取消寄書
+
+    # 取消寄書：按確認當下用紀錄ID重新找列（中間有人建單，列號會往下移）
     if pend["type"] == "cancel_order":
+        _PENDING.pop(user_id, None)
         ws = _ws(pend["sheet"])
-        idxH = pend["idx"]["H"]
-        idxL = pend["idx"]["L"]
-        idxM = pend["idx"]["M"]
-        
+        h = _get_header_map(ws)
+        idxH = _col_idx(h, "業務備註", _col_idx(h, "備註", 8))
+        idxL = _col_idx(h, "經手人", _col_idx(h, "已託運-經手人", 12))
+        idxM = _col_idx(h, "寄送狀態", _col_idx(h, "狀態", 13))
+        rows = _collect_rows_by_rid(ws, pend["rid"])
+        todo = [(i, r) for i, r in rows if (r[idxM - 1] if len(r) >= idxM else "").strip() == "待處理"]
+        if not todo:
+            _reply(event, f"❌ {pend['rid']} 已經不是「待處理」，沒有刪除")
+            return True
         append_note = f"[已刪除 {now_str_min()}]"
-        for row_i in pend["rows"]:
-            try:
-                curr_h = ws.cell(row_i, idxH).value or ""
-            except Exception:
-                curr_h = ""
+        for row_i, r in todo:
+            curr_h = r[idxH - 1] if len(r) >= idxH else ""
             new_h = (curr_h + " " + append_note).strip() if curr_h else append_note
             _safe_update_cell(ws, row_i, idxH, new_h)
             _safe_update_cell(ws, row_i, idxL, pend["operator"])
             _safe_update_cell(ws, row_i, idxM, "已刪除")
-        
-        msg = f"✅ 已刪除整筆寄書（{pend['rid']}）：{pend['stu']} 的 {pend['book_list']}"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        _PENDING.pop(event.source.user_id, None)
+
+        _reply(event, f"✅ 已刪除整筆寄書（{pend['rid']}）：{pend['stu']} 的 {pend['book_list']}")
         return True
-    
+
     # 入庫確認
     if pend["type"] == "stock_in_confirm":
+        _PENDING.pop(user_id, None)
         _write_stockin_rows(pend["operator"], pend["items"])
         lines = [f"{it['name']} × {it['qty']}" for it in pend["items"]]
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 入庫完成：\n" + "\n".join(lines)))
-        _PENDING.pop(event.source.user_id, None)
+        _reply(event, "✅ 入庫完成：\n" + "\n".join(lines))
         return True
-    
-    # 整理寄書確認（修復 S2：只保留一份）
+
+    # 整理寄書確認
     if pend["type"] == "organize_order_confirm":
+        _PENDING.pop(user_id, None)
         data = pend["data"]
         fake_text = (
             "#寄書\n"
@@ -2029,106 +2127,10 @@ def _handle_pending_answer(event, text: str) -> bool:
             f"業務備註：{data['biz_note']}"
         )
         _handle_new_order(event, fake_text)
-        _PENDING.pop(event.source.user_id, None)
         return True
-    
+
     return False
 
-def _handle_book_selection(event, choice: int) -> bool:
-    """處理書籍選擇（新功能）"""
-    pend = _PENDING.get(event.source.user_id)
-    if not pend or pend.get("type") != "order_correction":
-        return False
-    
-    errors = pend.get("errors", {})
-    if "books" not in errors:
-        return False
-    
-    # 找到第一個有建議的錯誤書名
-    for err_item in errors["books"]:
-        if isinstance(err_item, dict) and err_item.get("suggestions"):
-            suggestions = err_item["suggestions"]
-            if 1 <= choice <= len(suggestions):
-                selected_book = suggestions[choice - 1]
-                
-                # 更新資料中的書名
-                old_name = err_item["wrong"]
-                current_books = pend["data"]["book"]
-                new_books = current_books.replace(old_name, selected_book)
-                pend["data"]["book"] = new_books
-                
-                # 重新驗證
-                validation_data = pend["data"]
-                new_errors = _validate_order_data(validation_data)
-                
-                if not new_errors:
-                    # 無錯誤，直接建立訂單
-                    _create_order_confirmed(
-                        event,
-                        validation_data["name"],
-                        validation_data["phone"],
-                        validation_data["address"],
-                        new_books,
-                        pend.get("biz_note", "")
-                    )
-                    _PENDING.pop(event.source.user_id, None)
-                else:
-                    # 還有其他錯誤，繼續引導
-                    pend["errors"] = new_errors
-                    error_msg = _format_validation_errors(new_errors)
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=error_msg))
-                
-                return True
-    
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 無效的選項"))
-    return True
-
-# ============================================
-# ClassPlus 訂課處理
-# ============================================
-def _handle_classplus_order(event, text: str):
-    """處理 #訂課 指令"""
-    uid = getattr(event.source, "user_id", "")
-    student_info = parse_student_info(text)
-
-    if not student_info.get("name"):
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=(
-                "❌ 格式錯誤，請依以下格式輸入：\n\n"
-                "#訂課\n"
-                "學生姓名：\n"
-                "學生程度：\n"
-                "信箱：\n"
-                "學習備註："
-            ))
-        )
-        return
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=f"⏳ 正在處理 {student_info['name']} 的訂課，請稍候...")
-    )
-
-    result = run_classplus_task(student_info)
-    msg = format_result_message(result, student_info)
-
-    try:
-        if result.get("screenshot"):
-            import io
-            from linebot.models import ImageSendMessage
-            # 上傳截圖並回傳
-            line_bot_api.push_message(
-                getattr(event.source, "group_id", uid) or uid,
-                TextSendMessage(text=msg)
-            )
-        else:
-            line_bot_api.push_message(
-                getattr(event.source, "group_id", uid) or uid,
-                TextSendMessage(text=msg)
-            )
-    except Exception as e:
-        app.logger.error(f"[CLASSPLUS] 回傳訊息失敗: {e}")
 
 
 # ============================================
@@ -2152,6 +2154,8 @@ def callback():
 def handle_text_message(event):
     """處理文字訊息"""
     text = (event.message.text or "").strip()
+    # 全形＃、「# 寄書」中間有空白都當指令
+    text = re.sub(r"^[#＃]\s*", "#", text)
     
     # #我的ID（不受白名單限制）
     if text.startswith("#我的ID"):
@@ -2172,6 +2176,10 @@ def handle_text_message(event):
             _log_candidate(uid, name)
         return
     
+    # 打了新指令就放棄上一個沒完成的流程（不再卡「您有未完成的選書流程」）
+    if text.startswith("#"):
+        _PENDING.pop(getattr(event.source, "user_id", ""), None)
+
     # 待確認流程
     if _handle_pending_answer(event, text):
         return
@@ -2181,10 +2189,6 @@ def handle_text_message(event):
         return
     
     # 處理指令
-    if text.startswith("#訂課"):
-        _handle_classplus_order(event, text)
-        return
-
     if text.startswith("#查書名"):
         _handle_search_books(event, text)
         return
